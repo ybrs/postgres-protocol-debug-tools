@@ -1,0 +1,15 @@
+[package]
+name = "pg-client-inspect"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.93"
+bytes = "1.6.0"
+clap = { version = "4.5.20", features = ["derive"] }
+md5 = "0.7.0"
+postgres-protocol = "0.6.9"
+fallible-iterator = "0.2.0"
+
+[dev-dependencies]
+hex = "0.4.3"

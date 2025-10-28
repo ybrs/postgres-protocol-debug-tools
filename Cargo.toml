@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "pg-client-inspect",
+    "postgres-wire-proxy",
+]
+resolver = "2"
