@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -48,6 +48,11 @@ struct Args {
     /// Log format (full, short, bare)
     #[arg(long, value_enum, default_value_t = LogFormat::Full)]
     log_format: LogFormat,
+
+    /// Include hex dumps of wire data in logs
+    #[arg(long = "hex-dump", action = ArgAction::SetTrue, default_value_t = true)]
+    #[arg(long = "no-hex-dump", action = ArgAction::SetFalse)]
+    hex_dump: bool,
 }
 
 #[tokio::main]
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         "Forwarding to {}:{}",
         args.upstream_host, args.upstream_port
     );
+    let hex_dump = args.hex_dump;
 
     loop {
         let (client_socket, client_addr) = listener.accept().await?;
@@ -93,6 +99,7 @@ async fn main() -> Result<()> {
         let upstream_host = args.upstream_host.clone();
         let upstream_port = args.upstream_port;
         let ssl_config = ssl_config.clone();
+        let hex_dump = hex_dump;
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -101,6 +108,7 @@ async fn main() -> Result<()> {
                 upstream_host,
                 upstream_port,
                 ssl_config,
+                hex_dump,
             )
             .await
             {
@@ -139,6 +147,7 @@ async fn handle_connection(
     upstream_host: String,
     upstream_port: u16,
     ssl_config: Option<Arc<rustls::ServerConfig>>,
+    hex_dump: bool,
 ) -> Result<()> {
     // Check if client wants SSL
     let mut startup_buf = BytesMut::with_capacity(8);
@@ -196,6 +205,7 @@ async fn handle_connection(
                 client_addr,
                 upstream_host,
                 upstream_port,
+                hex_dump,
             )
             .await;
         } else {
@@ -219,6 +229,7 @@ async fn handle_connection(
         client_addr,
         upstream_host,
         upstream_port,
+        hex_dump,
     )
     .await
 }
@@ -229,6 +240,7 @@ async fn proxy_with_tls(
     client_addr: String,
     upstream_host: String,
     upstream_port: u16,
+    hex_dump: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -241,7 +253,14 @@ async fn proxy_with_tls(
 
     info!("[{}] Connected to upstream", client_addr);
 
-    run_proxy(client_stream, upstream_socket, startup_buf, client_addr).await
+    run_proxy(
+        client_stream,
+        upstream_socket,
+        startup_buf,
+        client_addr,
+        hex_dump,
+    )
+    .await
 }
 
 async fn proxy_with_tcp(
@@ -250,6 +269,7 @@ async fn proxy_with_tcp(
     client_addr: String,
     upstream_host: String,
     upstream_port: u16,
+    hex_dump: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -262,7 +282,14 @@ async fn proxy_with_tcp(
 
     info!("[{}] Connected to upstream", client_addr);
 
-    run_proxy(client_stream, upstream_socket, startup_buf, client_addr).await
+    run_proxy(
+        client_stream,
+        upstream_socket,
+        startup_buf,
+        client_addr,
+        hex_dump,
+    )
+    .await
 }
 
 async fn run_proxy<C>(
@@ -270,6 +297,7 @@ async fn run_proxy<C>(
     mut upstream_socket: TcpStream,
     startup_buf: BytesMut,
     client_addr: String,
+    hex_dump: bool,
 ) -> Result<()>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
@@ -309,6 +337,7 @@ where
                         MessageDirection::ClientToServer,
                         &client_addr_clone,
                         Some(&*timings_clone),
+                        hex_dump,
                     );
 
                     // Forward to upstream
@@ -347,6 +376,7 @@ where
                         MessageDirection::ServerToClient,
                         &client_addr_clone,
                         Some(&*timings_clone),
+                        hex_dump,
                     );
 
                     // Forward to client

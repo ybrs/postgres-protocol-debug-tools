@@ -95,6 +95,7 @@ pub fn parse_message(
     direction: MessageDirection,
     client_addr: &str,
     timings: Option<&ConnectionTiming>,
+    hex_dump: bool,
 ) {
     let mut buf = data;
     let arrow = match direction {
@@ -125,7 +126,9 @@ pub fn parse_message(
         }
 
         // Log hex dump
-        log_hex_dump(full_message, client_addr);
+        if hex_dump {
+            log_hex_dump(full_message, client_addr);
+        }
 
         buf = &buf[length + 1..];
     }
@@ -228,22 +231,55 @@ fn parse_client_message(
         }
         'D' => {
             // Describe
-            let describe_type = if !data.is_empty() {
-                match data[0] as char {
-                    'S' => "statement",
-                    'P' => "portal",
-                    _ => "unknown",
-                }
+            if data.is_empty() {
+                info!("[{}] {} Describe (unknown)", client_addr, arrow);
+                return;
+            }
+
+            let describe_target = data[0] as char;
+            let name = if data.len() > 1 {
+                let rest = &data[1..];
+                let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+                let raw = &rest[..end];
+                String::from_utf8_lossy(raw).to_string()
             } else {
-                "unknown"
+                String::new()
             };
-            info!(
-                "[{}] {} Describe ({}, {} bytes)",
-                client_addr,
-                arrow,
-                describe_type,
-                data.len()
-            );
+            let formatted_name = if name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                name
+            };
+
+            let describe_type = match describe_target {
+                'S' => "statement",
+                'P' => "portal",
+                _ => "unknown",
+            };
+
+            match describe_target {
+                'S' => info!(
+                    "[{}] {} Describe (statement '{}', {} bytes)",
+                    client_addr,
+                    arrow,
+                    formatted_name,
+                    data.len()
+                ),
+                'P' => info!(
+                    "[{}] {} Describe (portal '{}', {} bytes)",
+                    client_addr,
+                    arrow,
+                    formatted_name,
+                    data.len()
+                ),
+                _ => info!(
+                    "[{}] {} Describe ({}, {} bytes)",
+                    client_addr,
+                    arrow,
+                    describe_type,
+                    data.len()
+                ),
+            };
         }
         'S' => {
             // Sync
@@ -849,29 +885,24 @@ fn get_pg_type_name(oid: u32) -> &'static str {
 fn parse_bind_message(data: &[u8]) -> Option<String> {
     let mut i = 0;
 
-    // Portal name (null-terminated string)
-    let mut portal_name = Vec::new();
-    while i < data.len() && data[i] != 0 {
-        portal_name.push(data[i]);
-        i += 1;
-    }
-    i += 1; // Skip null terminator
-
-    // Statement name (null-terminated string)
-    let mut stmt_name = Vec::new();
-    while i < data.len() && data[i] != 0 {
-        stmt_name.push(data[i]);
-        i += 1;
-    }
-    i += 1; // Skip null terminator
+    let portal_name = read_cstring(data, &mut i)?;
+    let stmt_name = read_cstring(data, &mut i)?;
 
     if i + 2 > data.len() {
         return None;
     }
 
-    // Format codes count
-    let format_count = u16::from_be_bytes([data[i], data[i + 1]]);
-    i += 2 + (format_count as usize * 2);
+    // Parameter format codes
+    let param_format_count = u16::from_be_bytes([data[i], data[i + 1]]);
+    i += 2;
+    let mut param_formats = Vec::new();
+    for _ in 0..param_format_count {
+        if i + 2 > data.len() {
+            return None;
+        }
+        param_formats.push(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
 
     if i + 2 > data.len() {
         return None;
@@ -879,24 +910,108 @@ fn parse_bind_message(data: &[u8]) -> Option<String> {
 
     // Parameter count
     let param_count = u16::from_be_bytes([data[i], data[i + 1]]);
+    i += 2;
 
-    let portal_str = String::from_utf8_lossy(&portal_name);
-    let stmt_str = String::from_utf8_lossy(&stmt_name);
+    // Skip parameter values
+    for _ in 0..param_count {
+        if i + 4 > data.len() {
+            return None;
+        }
+        let value_len = i32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        i += 4;
+
+        if value_len < 0 {
+            continue;
+        }
+
+        let value_len = value_len as usize;
+        if i + value_len > data.len() {
+            return None;
+        }
+        i += value_len;
+    }
+
+    if i + 2 > data.len() {
+        return None;
+    }
+
+    // Result format codes
+    let result_format_count = u16::from_be_bytes([data[i], data[i + 1]]);
+    i += 2;
+    let mut result_formats = Vec::new();
+    for _ in 0..result_format_count {
+        if i + 2 > data.len() {
+            return None;
+        }
+        result_formats.push(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+
+    let portal_str = format_identifier(&portal_name);
+    let stmt_str = format_identifier(&stmt_name);
+    let param_formats_desc =
+        describe_format_codes("ParamFormats", param_format_count, &param_formats);
+    let result_formats_desc =
+        describe_format_codes("ResultFormats", result_format_count, &result_formats);
 
     Some(format!(
-        "Portal='{}', Statement='{}', Parameters={}",
-        if portal_str.is_empty() {
-            "(unnamed)"
-        } else {
-            &portal_str
-        },
-        if stmt_str.is_empty() {
-            "(unnamed)"
-        } else {
-            &stmt_str
-        },
-        param_count
+        "Portal='{}', Statement='{}', Parameters={}, {}, {}",
+        portal_str, stmt_str, param_count, param_formats_desc, result_formats_desc
     ))
+}
+
+fn read_cstring(data: &[u8], index: &mut usize) -> Option<Vec<u8>> {
+    if *index >= data.len() {
+        return None;
+    }
+
+    let start = *index;
+    while *index < data.len() && data[*index] != 0 {
+        *index += 1;
+    }
+
+    if *index >= data.len() {
+        return None;
+    }
+
+    let value = data[start..*index].to_vec();
+    *index += 1; // Skip null terminator
+    Some(value)
+}
+
+fn format_identifier(bytes: &[u8]) -> String {
+    let name = String::from_utf8_lossy(bytes).to_string();
+    if name.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        name
+    }
+}
+
+fn describe_format_codes(label: &str, count: u16, codes: &[u16]) -> String {
+    match count {
+        0 => format!("{label}=text (all)"),
+        1 => {
+            let code = codes.get(0).copied().unwrap_or(0);
+            format!("{label}={} (all)", format_format(code))
+        }
+        _ => {
+            let formats = codes
+                .iter()
+                .map(|code| format_format(*code))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{label}=[{}]", formats)
+        }
+    }
+}
+
+fn format_format(code: u16) -> &'static str {
+    match code {
+        0 => "text",
+        1 => "binary",
+        _ => "unknown",
+    }
 }
 
 fn parse_parameter_description(data: &[u8]) -> Option<Vec<String>> {
@@ -944,5 +1059,51 @@ mod tests {
     fn format_duration_outputs_seconds() {
         let dur = Duration::from_millis(1500);
         assert_eq!(format_duration(dur), "1.500s");
+    }
+
+    #[test]
+    fn bind_message_reports_all_binary_result_format() {
+        let data = vec![
+            0, // portal ""
+            b'_', b'p', b'1', 0, // statement "_p1"
+            0, 0, // param format count = 0
+            0, 0, // param count = 0
+            0, 1, // result format count = 1
+            0, 1, // binary for all
+        ];
+
+        let summary = parse_bind_message(&data).expect("bind parsed");
+        assert!(
+            summary.contains("ResultFormats=binary (all)"),
+            "summary missing binary all: {summary}"
+        );
+        assert!(
+            summary.contains("ParamFormats=text (all)"),
+            "summary missing default param format: {summary}"
+        );
+    }
+
+    #[test]
+    fn bind_message_reports_per_column_formats() {
+        let data = vec![
+            0, // portal ""
+            b'_', b'p', b'1', 0, // statement "_p1"
+            0, 1, // param format count = 1
+            0, 1, // binary params
+            0, 0, // param count = 0
+            0, 2, // result format count = 2
+            0, 0, // column 1 text
+            0, 1, // column 2 binary
+        ];
+
+        let summary = parse_bind_message(&data).expect("bind parsed");
+        assert!(
+            summary.contains("ParamFormats=binary (all)"),
+            "summary missing binary params: {summary}"
+        );
+        assert!(
+            summary.contains("ResultFormats=[text, binary]"),
+            "summary missing per-column formats: {summary}"
+        );
     }
 }
