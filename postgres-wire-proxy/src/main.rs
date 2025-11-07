@@ -11,6 +11,8 @@ use tracing::{error, info, warn};
 
 mod protocol;
 use protocol::{parse_message, MessageDirection};
+mod logging;
+use logging::{setup_logging, LogFormat};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "PostgreSQL wire protocol proxy", long_about = None)]
@@ -42,6 +44,10 @@ struct Args {
     /// Log file path (optional, logs always go to stdout)
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Log format (full, short, bare)
+    #[arg(long, value_enum, default_value_t = LogFormat::Full)]
+    log_format: LogFormat,
 }
 
 #[tokio::main]
@@ -49,7 +55,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Setup logging
-    setup_logging(args.log_file.as_ref())?;
+    setup_logging(args.log_file.as_ref(), args.log_format)?;
 
     // Validate SSL configuration
     let ssl_config = if let Some(cert_path) = &args.ssl_cert {
@@ -68,7 +74,10 @@ async fn main() -> Result<()> {
         .context("Failed to bind to listen address")?;
 
     if ssl_config.is_some() {
-        info!("PostgreSQL proxy listening on {} (SSL enabled)", listen_addr);
+        info!(
+            "PostgreSQL proxy listening on {} (SSL enabled)",
+            listen_addr
+        );
     } else {
         info!("PostgreSQL proxy listening on {} (non-SSL)", listen_addr);
     }
@@ -101,40 +110,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn setup_logging(log_file: Option<&PathBuf>) -> Result<()> {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    if let Some(log_path) = log_file {
-        let file = File::create(log_path).context("Failed to create log file")?;
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(Arc::new(file))
-            .with_ansi(false);
-
-        let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(file_layer)
-            .with(stdout_layer)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(std::io::stdout)
-            .init();
-    }
-
-    Ok(())
-}
-
-fn load_ssl_config(
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
-) -> Result<Arc<rustls::ServerConfig>> {
+fn load_ssl_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<Arc<rustls::ServerConfig>> {
     let cert_file = File::open(cert_path).context("Failed to open certificate file")?;
     let key_file = File::open(key_path).context("Failed to open key file")?;
 
@@ -176,8 +152,18 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let _length = u32::from_be_bytes([startup_buf[0], startup_buf[1], startup_buf[2], startup_buf[3]]);
-    let protocol = u32::from_be_bytes([startup_buf[4], startup_buf[5], startup_buf[6], startup_buf[7]]);
+    let _length = u32::from_be_bytes([
+        startup_buf[0],
+        startup_buf[1],
+        startup_buf[2],
+        startup_buf[3],
+    ]);
+    let protocol = u32::from_be_bytes([
+        startup_buf[4],
+        startup_buf[5],
+        startup_buf[6],
+        startup_buf[7],
+    ]);
 
     // SSL request code is 80877103
     if protocol == 80877103 {
@@ -204,7 +190,14 @@ async fn handle_connection(
                 .context("Failed to read startup after SSL")?;
 
             // Connect to upstream and proxy with TLS stream
-            return proxy_with_tls(tls_stream, startup_buf, client_addr, upstream_host, upstream_port).await;
+            return proxy_with_tls(
+                tls_stream,
+                startup_buf,
+                client_addr,
+                upstream_host,
+                upstream_port,
+            )
+            .await;
         } else {
             // Reject SSL
             client_socket.write_all(&[b'N']).await?;
@@ -220,7 +213,14 @@ async fn handle_connection(
     }
 
     // Non-SSL path
-    proxy_with_tcp(client_socket, startup_buf, client_addr, upstream_host, upstream_port).await
+    proxy_with_tcp(
+        client_socket,
+        startup_buf,
+        client_addr,
+        upstream_host,
+        upstream_port,
+    )
+    .await
 }
 
 async fn proxy_with_tls(
@@ -298,7 +298,11 @@ where
                 }
                 Ok(n) => {
                     // Parse and log
-                    parse_message(&buf[..n], MessageDirection::ClientToServer, &client_addr_clone);
+                    parse_message(
+                        &buf[..n],
+                        MessageDirection::ClientToServer,
+                        &client_addr_clone,
+                    );
 
                     // Forward to upstream
                     if let Err(e) = upstream_write.write_all(&buf[..n]).await {
@@ -326,7 +330,11 @@ where
                 }
                 Ok(n) => {
                     // Parse and log
-                    parse_message(&buf[..n], MessageDirection::ServerToClient, &client_addr_clone);
+                    parse_message(
+                        &buf[..n],
+                        MessageDirection::ServerToClient,
+                        &client_addr_clone,
+                    );
 
                     // Forward to client
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
@@ -335,7 +343,10 @@ where
                     }
                 }
                 Err(e) => {
-                    error!("[{}] Failed to read from upstream: {}", client_addr_clone, e);
+                    error!(
+                        "[{}] Failed to read from upstream: {}",
+                        client_addr_clone, e
+                    );
                     break;
                 }
             }

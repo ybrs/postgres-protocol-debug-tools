@@ -65,7 +65,13 @@ fn log_hex_dump(data: &[u8], client_addr: &str) {
 
         let ascii_string: String = chunk
             .iter()
-            .map(|&b| if b >= 0x20 && b <= 0x7e { b as char } else { '.' })
+            .map(|&b| {
+                if b >= 0x20 && b <= 0x7e {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
 
         info!(
@@ -111,12 +117,7 @@ fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         'E' => {
             // Execute
-            info!(
-                "[{}] {} Execute ({} bytes)",
-                client_addr,
-                arrow,
-                data.len()
-            );
+            info!("[{}] {} Execute ({} bytes)", client_addr, arrow, data.len());
         }
         'D' => {
             // Describe
@@ -283,12 +284,7 @@ fn parse_server_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
                     }
                 }
             } else {
-                info!(
-                    "[{}] {} DataRow ({} bytes)",
-                    client_addr,
-                    arrow,
-                    data.len()
-                );
+                info!("[{}] {} DataRow ({} bytes)", client_addr, arrow, data.len());
             }
         }
         'C' => {
@@ -610,7 +606,11 @@ fn parse_data_row(data: &[u8]) -> Option<Vec<String>> {
                         .collect::<Vec<_>>()
                         .join(" ");
                     if value_bytes.len() > 32 {
-                        values.push(format!("<binary: {} ...> ({} bytes)", hex, value_bytes.len()));
+                        values.push(format!(
+                            "<binary: {} ...> ({} bytes)",
+                            hex,
+                            value_bytes.len()
+                        ));
                     } else {
                         values.push(format!("<binary: {}>", hex));
                     }

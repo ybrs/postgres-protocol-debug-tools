@@ -1,12 +1,10 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use clap::{ArgAction, Parser};
 use fallible_iterator::FallibleIterator;
-use postgres_protocol::message::backend::{
-    self, DataRowBody, Message, RowDescriptionBody,
-};
-use postgres_protocol::message::frontend::{self, BindError};
 use postgres_protocol::IsNull;
+use postgres_protocol::message::backend::{self, DataRowBody, Message, RowDescriptionBody};
+use postgres_protocol::message::frontend::{self, BindError};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -79,13 +77,14 @@ impl Connection {
             ("user".to_string(), args.user.clone()),
             ("database".to_string(), args.database.clone()),
             ("client_encoding".to_string(), "UTF8".to_string()),
-            ("application_name".to_string(), "postgres-protocol-inspector".to_string()),
+            (
+                "application_name".to_string(),
+                "postgres-protocol-inspector".to_string(),
+            ),
         ];
         let mut buf = BytesMut::new();
         frontend::startup_message(
-            parameters
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str())),
+            parameters.iter().map(|(k, v)| (k.as_str(), v.as_str())),
             &mut buf,
         )
         .context("failed to encode startup message")?;
@@ -116,10 +115,7 @@ impl Connection {
                 Message::AuthenticationSasl(body) => {
                     let mut iter = body.mechanisms();
                     let mut mechanisms = Vec::new();
-                    while let Some(name) = iter
-                        .next()
-                        .context("failed to read SASL mechanism")?
-                    {
+                    while let Some(name) = iter.next().context("failed to read SASL mechanism")? {
                         mechanisms.push(name.to_string());
                     }
                     bail!("SASL authentication is not supported: {:?}", mechanisms);
@@ -356,7 +352,9 @@ fn debug_print_fields(fields: &[RowField]) {
     for (idx, field) in fields.iter().enumerate() {
         println!(
             "  col {idx}: name='{}' oid={} format={}",
-            field.name, field.type_oid, field.format_label()
+            field.name,
+            field.type_oid,
+            field.format_label()
         );
     }
 }
@@ -456,14 +454,11 @@ fn format_backend_error(body: backend::ErrorResponseBody) -> Result<String> {
     Ok(format_error_fields(body.fields())?)
 }
 
-fn format_error_fields(
-    fields: backend::ErrorFields<'_>,
-) -> Result<String> {
+fn format_error_fields(fields: backend::ErrorFields<'_>) -> Result<String> {
     let mut iter = fields;
     let mut parts = Vec::new();
     while let Some(field) = iter.next().context("failed to read error field")? {
-        let value = std::str::from_utf8(field.value_bytes())
-            .unwrap_or("<non-utf8>");
+        let value = std::str::from_utf8(field.value_bytes()).unwrap_or("<non-utf8>");
         parts.push(format!("{}={}", field.type_() as char, value));
     }
     Ok(parts.join(" "))

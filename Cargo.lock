@@ -534,6 +534,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "owo-colors"
+version = "4.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c6901729fa79e91a0913333229e9ca5dc725089d1c363b2f4b4760709dc4a52"
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,8 +606,10 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "owo-colors",
  "rustls",
  "rustls-pemfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
