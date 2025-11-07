@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 #[derive(Debug)]
@@ -6,7 +8,94 @@ pub enum MessageDirection {
     ServerToClient,
 }
 
-pub fn parse_message(data: &[u8], direction: MessageDirection, client_addr: &str) {
+#[derive(Default)]
+struct TimingState {
+    simple_query: Option<Instant>,
+    execute: Option<Instant>,
+    parse: Option<Instant>,
+    bind: Option<Instant>,
+}
+
+pub struct ConnectionTiming {
+    start: Instant,
+    state: Mutex<TimingState>,
+}
+
+impl ConnectionTiming {
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            state: Mutex::new(TimingState::default()),
+        }
+    }
+
+    pub fn mark_simple_query(&self) {
+        self.state.lock().unwrap().simple_query = Some(Instant::now());
+    }
+
+    pub fn mark_execute(&self) {
+        self.state.lock().unwrap().execute = Some(Instant::now());
+    }
+
+    pub fn mark_parse(&self) {
+        self.state.lock().unwrap().parse = Some(Instant::now());
+    }
+
+    pub fn mark_bind(&self) {
+        self.state.lock().unwrap().bind = Some(Instant::now());
+    }
+
+    pub fn finish_simple_query(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .simple_query
+            .take()
+            .map(|start| start.elapsed())
+    }
+
+    pub fn finish_execute(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .execute
+            .take()
+            .map(|start| start.elapsed())
+    }
+
+    pub fn finish_parse(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .parse
+            .take()
+            .map(|start| start.elapsed())
+    }
+
+    pub fn finish_bind(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .bind
+            .take()
+            .map(|start| start.elapsed())
+    }
+
+    pub fn session_elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+}
+
+pub fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
+}
+
+pub fn parse_message(
+    data: &[u8],
+    direction: MessageDirection,
+    client_addr: &str,
+    timings: Option<&ConnectionTiming>,
+) {
     let mut buf = data;
     let arrow = match direction {
         MessageDirection::ClientToServer => "→",
@@ -28,10 +117,10 @@ pub fn parse_message(data: &[u8], direction: MessageDirection, client_addr: &str
 
         match direction {
             MessageDirection::ClientToServer => {
-                parse_client_message(msg_type, msg_data, client_addr, arrow);
+                parse_client_message(msg_type, msg_data, client_addr, arrow, timings);
             }
             MessageDirection::ServerToClient => {
-                parse_server_message(msg_type, msg_data, client_addr, arrow);
+                parse_server_message(msg_type, msg_data, client_addr, arrow, timings);
             }
         }
 
@@ -81,10 +170,19 @@ fn log_hex_dump(data: &[u8], client_addr: &str) {
     }
 }
 
-fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &str) {
+fn parse_client_message(
+    msg_type: char,
+    data: &[u8],
+    client_addr: &str,
+    arrow: &str,
+    timings: Option<&ConnectionTiming>,
+) {
     match msg_type {
         'Q' => {
             // Simple query
+            if let Some(t) = timings {
+                t.mark_simple_query();
+            }
             if let Ok(query) = std::str::from_utf8(&data[..data.len().saturating_sub(1)]) {
                 info!("[{}] {} Query: {}", client_addr, arrow, query);
             } else {
@@ -98,6 +196,9 @@ fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         'P' => {
             // Parse (prepared statement)
+            if let Some(t) = timings {
+                t.mark_parse();
+            }
             info!(
                 "[{}] {} Parse (prepared statement, {} bytes)",
                 client_addr,
@@ -110,6 +211,9 @@ fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         'B' => {
             // Bind
+            if let Some(t) = timings {
+                t.mark_bind();
+            }
             info!("[{}] {} Bind ({} bytes)", client_addr, arrow, data.len());
             if let Some(bind_info) = parse_bind_message(data) {
                 info!("[{}]    {}", client_addr, bind_info);
@@ -117,6 +221,9 @@ fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         'E' => {
             // Execute
+            if let Some(t) = timings {
+                t.mark_execute();
+            }
             info!("[{}] {} Execute ({} bytes)", client_addr, arrow, data.len());
         }
         'D' => {
@@ -196,7 +303,13 @@ fn parse_client_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
     }
 }
 
-fn parse_server_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &str) {
+fn parse_server_message(
+    msg_type: char,
+    data: &[u8],
+    client_addr: &str,
+    arrow: &str,
+    timings: Option<&ConnectionTiming>,
+) {
     match msg_type {
         'R' => {
             // Authentication
@@ -289,7 +402,48 @@ fn parse_server_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         'C' => {
             // CommandComplete
-            if let Ok(tag) = std::str::from_utf8(&data[..data.len().saturating_sub(1)]) {
+            let tag = std::str::from_utf8(&data[..data.len().saturating_sub(1)]).ok();
+            if let Some(t) = timings {
+                if let Some(duration) = t.finish_simple_query() {
+                    if let Some(tag) = tag {
+                        info!(
+                            "[{}] {} CommandComplete: {} (query took {})",
+                            client_addr,
+                            arrow,
+                            tag,
+                            format_duration(duration)
+                        );
+                    } else {
+                        info!(
+                            "[{}] {} CommandComplete (query took {})",
+                            client_addr,
+                            arrow,
+                            format_duration(duration)
+                        );
+                    }
+                    return;
+                } else if let Some(duration) = t.finish_execute() {
+                    if let Some(tag) = tag {
+                        info!(
+                            "[{}] {} CommandComplete: {} (execute took {})",
+                            client_addr,
+                            arrow,
+                            tag,
+                            format_duration(duration)
+                        );
+                    } else {
+                        info!(
+                            "[{}] {} CommandComplete (execute took {})",
+                            client_addr,
+                            arrow,
+                            format_duration(duration)
+                        );
+                    }
+                    return;
+                }
+            }
+
+            if let Some(tag) = tag {
                 info!("[{}] {} CommandComplete: {}", client_addr, arrow, tag);
             } else {
                 info!("[{}] {} CommandComplete", client_addr, arrow);
@@ -311,10 +465,32 @@ fn parse_server_message(msg_type: char, data: &[u8], client_addr: &str, arrow: &
         }
         '1' => {
             // ParseComplete
+            if let Some(t) = timings {
+                if let Some(duration) = t.finish_parse() {
+                    info!(
+                        "[{}] {} ParseComplete (took {})",
+                        client_addr,
+                        arrow,
+                        format_duration(duration)
+                    );
+                    return;
+                }
+            }
             info!("[{}] {} ParseComplete", client_addr, arrow);
         }
         '2' => {
             // BindComplete
+            if let Some(t) = timings {
+                if let Some(duration) = t.finish_bind() {
+                    info!(
+                        "[{}] {} BindComplete (took {})",
+                        client_addr,
+                        arrow,
+                        format_duration(duration)
+                    );
+                    return;
+                }
+            }
             info!("[{}] {} BindComplete", client_addr, arrow);
         }
         '3' => {
@@ -749,5 +925,24 @@ fn parse_parameter_description(data: &[u8]) -> Option<Vec<String>> {
         None
     } else {
         Some(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_query_timing_measures_once() {
+        let timing = ConnectionTiming::new();
+        timing.mark_simple_query();
+        assert!(timing.finish_simple_query().is_some());
+        assert!(timing.finish_simple_query().is_none());
+    }
+
+    #[test]
+    fn format_duration_outputs_seconds() {
+        let dur = Duration::from_millis(1500);
+        assert_eq!(format_duration(dur), "1.500s");
     }
 }

@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
 mod protocol;
-use protocol::{parse_message, MessageDirection};
+use protocol::{format_duration, parse_message, ConnectionTiming, MessageDirection};
 mod logging;
 use logging::{setup_logging, LogFormat};
 
@@ -285,15 +285,21 @@ where
     // Proxy messages bidirectionally
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut upstream_read, mut upstream_write) = upstream_socket.into_split();
+    let timings = Arc::new(ConnectionTiming::new());
 
     let client_addr_clone = client_addr.clone();
+    let timings_clone = timings.clone();
     let client_to_upstream = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
         loop {
             buf.clear();
             match client_read.read_buf(&mut buf).await {
                 Ok(0) => {
-                    info!("[{}] Client closed connection", client_addr_clone);
+                    info!(
+                        "[{}] Client closed connection (session {})",
+                        client_addr_clone,
+                        format_duration(timings_clone.session_elapsed())
+                    );
                     break;
                 }
                 Ok(n) => {
@@ -302,6 +308,7 @@ where
                         &buf[..n],
                         MessageDirection::ClientToServer,
                         &client_addr_clone,
+                        Some(&*timings_clone),
                     );
 
                     // Forward to upstream
@@ -319,13 +326,18 @@ where
     });
 
     let client_addr_clone = client_addr.clone();
+    let timings_clone = timings.clone();
     let upstream_to_client = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
         loop {
             buf.clear();
             match upstream_read.read_buf(&mut buf).await {
                 Ok(0) => {
-                    info!("[{}] Upstream closed connection", client_addr_clone);
+                    info!(
+                        "[{}] Upstream closed connection (session {})",
+                        client_addr_clone,
+                        format_duration(timings_clone.session_elapsed())
+                    );
                     break;
                 }
                 Ok(n) => {
@@ -334,6 +346,7 @@ where
                         &buf[..n],
                         MessageDirection::ServerToClient,
                         &client_addr_clone,
+                        Some(&*timings_clone),
                     );
 
                     // Forward to client
@@ -359,6 +372,10 @@ where
         _ = upstream_to_client => {},
     }
 
-    info!("[{}] Connection closed", client_addr);
+    info!(
+        "[{}] Connection closed (session {})",
+        client_addr,
+        format_duration(timings.session_elapsed())
+    );
     Ok(())
 }
