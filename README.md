@@ -3,6 +3,8 @@
 We have some complementary tools for inspecting and debugging PostgreSQL wire protocol traffic.
 
 These are useful if you are building a postgresql wire compatible databases
+- [postgres-wire-proxy](#postgres-wire-proxy): A transparent proxy that sits between a PostgreSQL client and server
+- [pg-client-inspect](#pg-client-inspect): Inspect raw postgresql responses from client
 
 ## Protocol Debugging Proxy 
 
@@ -21,6 +23,23 @@ Run it with the standard Cargo command:
 
 ```bash
 cargo run -p postgres-wire-proxy -- --help
+
+PostgreSQL wire protocol proxy
+
+Usage: postgres-wire-proxy [OPTIONS]
+
+Options:
+  -l, --listen <LISTEN>                Listen address [default: 127.0.0.1]
+  -p, --port <PORT>                    Listen port [default: 5466]
+      --upstream-host <UPSTREAM_HOST>  Upstream PostgreSQL host [default: localhost]
+      --upstream-port <UPSTREAM_PORT>  Upstream PostgreSQL port [default: 5432]
+      --ssl-cert <SSL_CERT>            SSL certificate file (enables SSL mode)
+      --ssl-key <SSL_KEY>              SSL private key file (required if ssl-cert is provided)
+      --log-file <LOG_FILE>            Log file path (optional, logs always go to stdout)
+      --log-format <LOG_FORMAT>        Log format (full, short, bare) Full: Timestamp, Level, Target/Module, ClientIP:Port, Message Short: Timestamp, ClientIP:Port, Message Bare: Client IP:Port, Message [default: full] [possible values: full, short, bare]
+      --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs,
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 You can point the upstream to your postgres compatible database and see the request responses in a human readable way.
@@ -83,7 +102,27 @@ You can point the upstream to your postgres compatible database and see the requ
 [127.0.0.1:57985]   0000: 58 00 00 00 
 ```
 
+
+The default is outputting a full log (with timestamp, location, severity etc.)
+
+![image info](./docs/full-log.png)
+
+In short format, we display timestamp and client and message. Use `--log-format short`
+
+![image info](./docs/short-log.png)
+
+In bare format, we display client and message. Use `--log-format bare`
+
+![image info](./docs/bare-log.png)
+
+Also you might want to hide hex wire message. Use `--no-hex-dump`
+
+![image info](./docs/no-hex-dump.png)
+
+
 ## Protocol Debugging Client
+
+### pg-client-inspect
 
 Currently you can send a prepared statement and select n=binary/text mode.
 
