@@ -83,6 +83,24 @@ You can point the upstream to your postgres compatible database and see the requ
 [127.0.0.1:57985]   0000: 58 00 00 00 
 ```
 
+
+The default is outputting a full log (with timestamp, location, severity etc.)
+
+![image info](./docs/full-log.png)
+
+In short format, we display timestamp and client and message. Use `--log-format short`
+
+![image info](./docs/short-log.png)
+
+In bare format, we display client and message. Use `--log-format bare`
+
+![image info](./docs/bare-log.png)
+
+Also you might want to hide hex wire message. Use `--no-hex-dump`
+
+![image info](./docs/no-hex-dump.png)
+
+
 ## Protocol Debugging Client
 
 Currently you can send a prepared statement and select n=binary/text mode.

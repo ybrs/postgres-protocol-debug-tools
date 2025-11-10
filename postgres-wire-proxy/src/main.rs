@@ -46,10 +46,13 @@ struct Args {
     log_file: Option<PathBuf>,
 
     /// Log format (full, short, bare)
+    /// Full: Timestamp, Level, Target/Module, ClientIP:Port, Message
+    /// Short: Timestamp, ClientIP:Port, Message
+    /// Bare: Client IP:Port, Message
     #[arg(long, value_enum, default_value_t = LogFormat::Full)]
     log_format: LogFormat,
 
-    /// Include hex dumps of wire data in logs
+    /// hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs, 
     #[arg(long = "hex-dump", action = ArgAction::SetTrue, default_value_t = true)]
     #[arg(long = "no-hex-dump", action = ArgAction::SetFalse)]
     hex_dump: bool,
