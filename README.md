@@ -3,6 +3,8 @@
 We have some complementary tools for inspecting and debugging PostgreSQL wire protocol traffic.
 
 These are useful if you are building a postgresql wire compatible databases
+- [postgres-wire-proxy](#postgres-wire-proxy): A transparent proxy that sits between a PostgreSQL client and server
+- [pg-client-inspect](#pg-client-inspect): Inspect raw postgresql responses from client
 
 ## Protocol Debugging Proxy 
 
@@ -102,6 +104,8 @@ Also you might want to hide hex wire message. Use `--no-hex-dump`
 
 
 ## Protocol Debugging Client
+
+### pg-client-inspect
 
 Currently you can send a prepared statement and select n=binary/text mode.
 
