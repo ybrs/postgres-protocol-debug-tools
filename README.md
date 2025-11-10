@@ -17,6 +17,7 @@ Key capabilities:
 - Detailed protocol decoding for both client and server messages
 - Optional TLS termination using `rustls`
 - Flexible logging (stdout and/or file sinks) powered by `tracing`
+- **Table mode**: Display query results in formatted tables instead of raw DataRow messages
 - Configurable via CLI flags for listener address, upstream target, and logging settings
 
 Run it with the standard Cargo command:
@@ -37,10 +38,35 @@ Options:
       --ssl-key <SSL_KEY>              SSL private key file (required if ssl-cert is provided)
       --log-file <LOG_FILE>            Log file path (optional, logs always go to stdout)
       --log-format <LOG_FORMAT>        Log format (full, short, bare) Full: Timestamp, Level, Target/Module, ClientIP:Port, Message Short: Timestamp, ClientIP:Port, Message Bare: Client IP:Port, Message [default: full] [possible values: full, short, bare]
-      --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs,
+      --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs
+      --table                          Enable table formatting for DataRow output
   -h, --help                           Print help
   -V, --version                        Print version
 ```
+
+**Table Mode Example:**
+
+Use `--table` to format query results as tables:
+
+```bash
+cargo run -p postgres-wire-proxy -- --table --no-hex-dump
+```
+
+Result output with `--table`:
+```
+[127.0.0.1:57985] ← RowDescription (2 fields)
+[127.0.0.1:57985]    Field 1: name='id', type=int4 (OID=23), format=binary
+[127.0.0.1:57985]    Field 2: name='name', type=text (OID=25), format=binary
+[127.0.0.1:57985] ┌───────────────┬───────────────┐
+[127.0.0.1:57985] │id             │name           │
+[127.0.0.1:57985] ├───────────────┼───────────────┤
+[127.0.0.1:57985] │1              │Alice          │
+[127.0.0.1:57985] │2              │Bob            │
+[127.0.0.1:57985] └───────────────┴───────────────┘
+[127.0.0.1:57985] ← CommandComplete: SELECT 2
+```
+
+Each column is fixed at 15 characters with automatic truncation for longer values.
 
 You can point the upstream to your postgres compatible database and see the request responses in a human readable way.
 
