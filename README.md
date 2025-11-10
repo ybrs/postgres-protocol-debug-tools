@@ -23,6 +23,23 @@ Run it with the standard Cargo command:
 
 ```bash
 cargo run -p postgres-wire-proxy -- --help
+
+PostgreSQL wire protocol proxy
+
+Usage: postgres-wire-proxy [OPTIONS]
+
+Options:
+  -l, --listen <LISTEN>                Listen address [default: 127.0.0.1]
+  -p, --port <PORT>                    Listen port [default: 5466]
+      --upstream-host <UPSTREAM_HOST>  Upstream PostgreSQL host [default: localhost]
+      --upstream-port <UPSTREAM_PORT>  Upstream PostgreSQL port [default: 5432]
+      --ssl-cert <SSL_CERT>            SSL certificate file (enables SSL mode)
+      --ssl-key <SSL_KEY>              SSL private key file (required if ssl-cert is provided)
+      --log-file <LOG_FILE>            Log file path (optional, logs always go to stdout)
+      --log-format <LOG_FORMAT>        Log format (full, short, bare) Full: Timestamp, Level, Target/Module, ClientIP:Port, Message Short: Timestamp, ClientIP:Port, Message Bare: Client IP:Port, Message [default: full] [possible values: full, short, bare]
+      --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs,
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 You can point the upstream to your postgres compatible database and see the request responses in a human readable way.
