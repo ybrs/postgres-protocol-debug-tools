@@ -2,6 +2,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+use crate::table_formatter::{FieldInfo, TableState};
+
 #[derive(Debug)]
 pub enum MessageDirection {
     ClientToServer,
@@ -90,11 +92,25 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
 }
 
+/// Per-client state for managing table formatting and row descriptions
+pub struct ClientState {
+    table_state: TableState,
+}
+
+impl ClientState {
+    pub fn new(table_mode: bool) -> Self {
+        Self {
+            table_state: TableState::new(table_mode),
+        }
+    }
+}
+
 pub fn parse_message(
     data: &[u8],
     direction: MessageDirection,
     client_addr: &str,
     timings: Option<&ConnectionTiming>,
+    client_state: &ClientState,
     hex_dump: bool,
 ) {
     let mut buf = data;
@@ -118,10 +134,10 @@ pub fn parse_message(
 
         match direction {
             MessageDirection::ClientToServer => {
-                parse_client_message(msg_type, msg_data, client_addr, arrow, timings);
+                parse_client_message(msg_type, msg_data, client_addr, arrow, timings, client_state);
             }
             MessageDirection::ServerToClient => {
-                parse_server_message(msg_type, msg_data, client_addr, arrow, timings);
+                parse_server_message(msg_type, msg_data, client_addr, arrow, timings, client_state);
             }
         }
 
@@ -179,6 +195,7 @@ fn parse_client_message(
     client_addr: &str,
     arrow: &str,
     timings: Option<&ConnectionTiming>,
+    _client_state: &ClientState,
 ) {
     match msg_type {
         'Q' => {
@@ -345,6 +362,7 @@ fn parse_server_message(
     client_addr: &str,
     arrow: &str,
     timings: Option<&ConnectionTiming>,
+    client_state: &ClientState,
 ) {
     match msg_type {
         'R' => {
@@ -409,7 +427,16 @@ fn parse_server_message(
                 );
                 if let Some(fields) = parse_row_description(data) {
                     for (i, field) in fields.iter().enumerate() {
-                        info!("[{}]    Field {}: {}", client_addr, i + 1, field);
+                        info!("[{}]    Field {}: {}", client_addr, i + 1, field.description);
+                    }
+
+                    // Set up table formatter if in table mode
+                    if client_state.table_state.is_table_mode() {
+                        let field_infos: Vec<FieldInfo> = fields
+                            .iter()
+                            .map(|f| f.field_info.clone())
+                            .collect();
+                        client_state.table_state.set_row_description(field_infos);
                     }
                 }
             } else {
@@ -420,16 +447,23 @@ fn parse_server_message(
             // DataRow
             if data.len() >= 2 {
                 let field_count = u16::from_be_bytes([data[0], data[1]]);
-                info!(
-                    "[{}] {} DataRow ({} fields, {} bytes)",
-                    client_addr,
-                    arrow,
-                    field_count,
-                    data.len()
-                );
+
                 if let Some(values) = parse_data_row(data) {
-                    for (i, value) in values.iter().enumerate() {
-                        info!("[{}]    Value {}: {}", client_addr, i + 1, value);
+                    // If in table mode, print as table row
+                    if client_state.table_state.is_table_mode() {
+                        client_state.table_state.print_data_row(&values, client_addr);
+                    } else {
+                        // Original logging format
+                        info!(
+                            "[{}] {} DataRow ({} fields, {} bytes)",
+                            client_addr,
+                            arrow,
+                            field_count,
+                            data.len()
+                        );
+                        for (i, value) in values.iter().enumerate() {
+                            info!("[{}]    Value {}: {}", client_addr, i + 1, value);
+                        }
                     }
                 }
             } else {
@@ -438,6 +472,11 @@ fn parse_server_message(
         }
         'C' => {
             // CommandComplete
+            // Finish table formatting if active
+            if client_state.table_state.is_table_mode() {
+                client_state.table_state.finish_result_set(client_addr);
+            }
+
             let tag = std::str::from_utf8(&data[..data.len().saturating_sub(1)]).ok();
             if let Some(t) = timings {
                 if let Some(duration) = t.finish_simple_query() {
@@ -701,7 +740,12 @@ fn parse_parse_message(data: &[u8]) -> Option<String> {
     }
 }
 
-fn parse_row_description(data: &[u8]) -> Option<Vec<String>> {
+struct RowDescriptionField {
+    field_info: FieldInfo,
+    description: String,
+}
+
+fn parse_row_description(data: &[u8]) -> Option<Vec<RowDescriptionField>> {
     if data.len() < 2 {
         return None;
     }
@@ -754,13 +798,20 @@ fn parse_row_description(data: &[u8]) -> Option<Vec<String>> {
         };
 
         let type_name = get_pg_type_name(type_oid);
-        let name_str = String::from_utf8_lossy(&field_name);
+        let name_str = String::from_utf8_lossy(&field_name).to_string();
 
-        let field_info = format!(
+        let description = format!(
             "name='{}', type={} (OID={}), size={}, typemod={}, format={}",
             name_str, type_name, type_oid, type_size, type_mod, format_str
         );
-        fields.push(field_info);
+
+        fields.push(RowDescriptionField {
+            field_info: FieldInfo {
+                name: name_str,
+                type_name: type_name.to_string(),
+            },
+            description,
+        });
     }
 
     if fields.is_empty() {

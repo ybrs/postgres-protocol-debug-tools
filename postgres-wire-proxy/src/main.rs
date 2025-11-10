@@ -9,8 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
+mod table_formatter;
 mod protocol;
-use protocol::{format_duration, parse_message, ConnectionTiming, MessageDirection};
+use protocol::{format_duration, parse_message, ClientState, ConnectionTiming, MessageDirection};
 mod logging;
 use logging::{setup_logging, LogFormat};
 
@@ -52,10 +53,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = LogFormat::Full)]
     log_format: LogFormat,
 
-    /// hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs, 
+    /// hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs,
     #[arg(long = "hex-dump", action = ArgAction::SetTrue, default_value_t = true)]
     #[arg(long = "no-hex-dump", action = ArgAction::SetFalse)]
     hex_dump: bool,
+
+    /// Enable table formatting for DataRow output
+    #[arg(long)]
+    table: bool,
 }
 
 #[tokio::main]
@@ -94,6 +99,7 @@ async fn main() -> Result<()> {
         args.upstream_host, args.upstream_port
     );
     let hex_dump = args.hex_dump;
+    let table_mode = args.table;
 
     loop {
         let (client_socket, client_addr) = listener.accept().await?;
@@ -103,6 +109,7 @@ async fn main() -> Result<()> {
         let upstream_port = args.upstream_port;
         let ssl_config = ssl_config.clone();
         let hex_dump = hex_dump;
+        let table_mode = table_mode;
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -112,6 +119,7 @@ async fn main() -> Result<()> {
                 upstream_port,
                 ssl_config,
                 hex_dump,
+                table_mode,
             )
             .await
             {
@@ -151,6 +159,7 @@ async fn handle_connection(
     upstream_port: u16,
     ssl_config: Option<Arc<rustls::ServerConfig>>,
     hex_dump: bool,
+    table_mode: bool,
 ) -> Result<()> {
     // Check if client wants SSL
     let mut startup_buf = BytesMut::with_capacity(8);
@@ -209,6 +218,7 @@ async fn handle_connection(
                 upstream_host,
                 upstream_port,
                 hex_dump,
+                table_mode,
             )
             .await;
         } else {
@@ -233,6 +243,7 @@ async fn handle_connection(
         upstream_host,
         upstream_port,
         hex_dump,
+        table_mode,
     )
     .await
 }
@@ -244,6 +255,7 @@ async fn proxy_with_tls(
     upstream_host: String,
     upstream_port: u16,
     hex_dump: bool,
+    table_mode: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -262,6 +274,7 @@ async fn proxy_with_tls(
         startup_buf,
         client_addr,
         hex_dump,
+        table_mode,
     )
     .await
 }
@@ -273,6 +286,7 @@ async fn proxy_with_tcp(
     upstream_host: String,
     upstream_port: u16,
     hex_dump: bool,
+    table_mode: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -291,6 +305,7 @@ async fn proxy_with_tcp(
         startup_buf,
         client_addr,
         hex_dump,
+        table_mode,
     )
     .await
 }
@@ -301,6 +316,7 @@ async fn run_proxy<C>(
     startup_buf: BytesMut,
     client_addr: String,
     hex_dump: bool,
+    table_mode: bool,
 ) -> Result<()>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
@@ -317,9 +333,11 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut upstream_read, mut upstream_write) = upstream_socket.into_split();
     let timings = Arc::new(ConnectionTiming::new());
+    let client_state = Arc::new(ClientState::new(table_mode));
 
     let client_addr_clone = client_addr.clone();
     let timings_clone = timings.clone();
+    let client_state_clone = client_state.clone();
     let client_to_upstream = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
         loop {
@@ -340,6 +358,7 @@ where
                         MessageDirection::ClientToServer,
                         &client_addr_clone,
                         Some(&*timings_clone),
+                        &*client_state_clone,
                         hex_dump,
                     );
 
@@ -359,6 +378,7 @@ where
 
     let client_addr_clone = client_addr.clone();
     let timings_clone = timings.clone();
+    let client_state_clone = client_state.clone();
     let upstream_to_client = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
         loop {
@@ -379,6 +399,7 @@ where
                         MessageDirection::ServerToClient,
                         &client_addr_clone,
                         Some(&*timings_clone),
+                        &*client_state_clone,
                         hex_dump,
                     );
 

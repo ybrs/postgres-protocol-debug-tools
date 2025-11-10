@@ -63,6 +63,44 @@ When SSL is configured, the proxy will:
 3. Forward decrypted traffic to upstream (non-SSL)
 4. Log all decrypted protocol messages
 
+### Table Mode
+
+Enable table formatting for query results with the `--table` flag. Instead of showing individual DataRow messages, results are displayed in a formatted table:
+
+```bash
+./target/release/postgres-wire-proxy --table --port 5466 --upstream-port 5432
+```
+
+When table mode is enabled:
+- **RowDescription** messages are still logged to show column metadata
+- **DataRow** messages are rendered as formatted table rows with:
+  - Column headers from RowDescription
+  - Automatic column width adjustment based on content
+  - Unicode box-drawing characters for borders
+  - Terminal width awareness (responsive to screen size)
+  - Graceful truncation with ellipsis for oversized content
+
+Example output with `--table`:
+```
+[127.0.0.1:57985] ← RowDescription (2 fields)
+[127.0.0.1:57985]    Field 1: name='id', type=int4 (OID=23), format=binary
+[127.0.0.1:57985]    Field 2: name='name', type=text (OID=25), format=binary
+[127.0.0.1:57985] ┌───────────────┬───────────────┐
+[127.0.0.1:57985] │id             │name           │
+[127.0.0.1:57985] ├───────────────┼───────────────┤
+[127.0.0.1:57985] │1              │Alice          │
+[127.0.0.1:57985] │2              │Bob            │
+[127.0.0.1:57985] │3              │Charlie        │
+[127.0.0.1:57985] └───────────────┴───────────────┘
+```
+
+Table mode features:
+- **Streaming**: Rows are printed as they arrive (no buffering)
+- **Fixed-width columns**: Each column is 15 characters wide for consistent alignment
+- **Automatic truncation**: Values longer than 15 characters are truncated with "..."
+- **NULL handling**: NULL values are displayed as-is in the table
+- **Multi-column support**: Handles any number of columns from the query
+
 ### All Options
 
 ```
@@ -74,6 +112,9 @@ Options:
       --ssl-cert <SSL_CERT>            SSL certificate file (enables SSL mode)
       --ssl-key <SSL_KEY>              SSL private key file (required if ssl-cert is provided)
       --log-file <LOG_FILE>            Log file path (optional, logs always go to stdout)
+      --log-format <LOG_FORMAT>        Log format (full, short, bare) [default: full]
+      --no-hex-dump                    Exclude hex dumps of wire data in logs
+      --table                          Enable table formatting for DataRow output
   -h, --help                           Print help
   -V, --version                        Print version
 ```
