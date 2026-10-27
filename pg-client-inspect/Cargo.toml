@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.93"
 bytes = "1.6.0"
 clap = { version = "4.5.20", features = ["derive"] }
-md5 = "0.7.0"
+md5 = "0.8"
 postgres-protocol = "0.6.9"
 fallible-iterator = "0.2.0"
 
