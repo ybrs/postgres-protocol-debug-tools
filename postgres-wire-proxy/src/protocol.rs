@@ -875,7 +875,6 @@ fn parse_row_description(data: &[u8]) -> Option<Vec<RowDescriptionField>> {
         fields.push(RowDescriptionField {
             field_info: FieldInfo {
                 name: name_str,
-                type_name: type_name.to_string(),
             },
             description,
         });

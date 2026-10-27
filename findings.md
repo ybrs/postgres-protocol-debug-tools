@@ -267,8 +267,11 @@ The `docs/*.png` screenshots are current; only the text block was behind.
 - **Cosmetic:** the mid-table separator uses `┬` instead of `┼` — `print_header`
   reuses `format_row`'s top border.
 - **Dead code:** the width helpers that used to be dead are now used by
-  `--table-dynamic-width` (§10); the remaining build warning is the
-  never-read `FieldInfo::type_name`.
+  `--table-dynamic-width` (§10), and the last warning — the never-read
+  `FieldInfo::type_name` — is fixed: the field was written for table mode and
+  never read by it, since `RowDescription` already logs the type of every
+  column, so it was removed rather than kept behind an `allow`. The workspace
+  now builds with no warnings.
 - **Formatting:** `cargo fmt --all` was not run. The repo has pre-existing
   rustfmt violations (module ordering in `main.rs`, several long calls), so
   reformatting would bury this change in unrelated churn. Only the new test file
@@ -344,7 +347,7 @@ pairing, so using it alone is an error naming the missing flag).
 
 The dead `detect_terminal_width()`, `unicode_display_width()` and the
 `terminal_width` field described in §5.1 are now what backs this, which is why the
-build went from five warnings to one (the never-read `FieldInfo::type_name`).
+build went from five warnings to none.
 
 Covered by unit tests in `table_formatter.rs` (content sizing, header sizing, the
 floor, shrinking to a budget, truncation, equal-width rendered rows) and three

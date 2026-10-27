@@ -5,7 +5,6 @@ use std::sync::Mutex;
 #[derive(Clone, Debug)]
 pub struct FieldInfo {
     pub name: String,
-    pub type_name: String,
 }
 
 /// Column width used when dynamic sizing is off.
@@ -332,11 +331,9 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "id".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "name".to_string(),
-                type_name: "text".to_string(),
             },
         ];
 
@@ -350,7 +347,6 @@ mod tests {
     fn table_formatter_uses_fixed_widths() {
         let fields = vec![FieldInfo {
             name: "col".to_string(),
-            type_name: "text".to_string(),
         }];
 
         let mut formatter = TableFormatter::new(fields, false);
@@ -381,7 +377,6 @@ mod tests {
 
         let fields = vec![FieldInfo {
             name: "test_col".to_string(),
-            type_name: "int4".to_string(),
         }];
 
         state.set_row_description(fields);
@@ -394,11 +389,9 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "id".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "name".to_string(),
-                type_name: "text".to_string(),
             },
         ];
 
@@ -413,11 +406,9 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "short".to_string(),
-                type_name: "text".to_string(),
             },
             FieldInfo {
                 name: "very_long_column_name".to_string(),
-                type_name: "text".to_string(),
             },
         ];
 
@@ -439,7 +430,6 @@ mod tests {
     fn table_formatter_handles_empty_values() {
         let fields = vec![FieldInfo {
             name: "col".to_string(),
-            type_name: "text".to_string(),
         }];
 
         let mut formatter = TableFormatter::new(fields, false);
@@ -453,19 +443,15 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "id".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "name".to_string(),
-                type_name: "text".to_string(),
             },
             FieldInfo {
                 name: "email".to_string(),
-                type_name: "text".to_string(),
             },
             FieldInfo {
                 name: "age".to_string(),
-                type_name: "int4".to_string(),
             },
         ];
 
@@ -507,11 +493,9 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "num".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "text".to_string(),
-                type_name: "text".to_string(),
             },
         ];
 
@@ -536,11 +520,9 @@ mod tests {
         let fields = vec![
             FieldInfo {
                 name: "id".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "name".to_string(),
-                type_name: "text".to_string(),
             },
         ];
 
@@ -567,11 +549,9 @@ mod tests {
         vec![
             FieldInfo {
                 name: "id".to_string(),
-                type_name: "int4".to_string(),
             },
             FieldInfo {
                 name: "name".to_string(),
-                type_name: "text".to_string(),
             },
         ]
     }
@@ -596,7 +576,6 @@ mod tests {
     fn dynamic_columns_fit_the_header_when_values_are_shorter() {
         let fields = vec![FieldInfo {
             name: "a_rather_long_column_name".to_string(),
-            type_name: "text".to_string(),
         }];
         let mut formatter = TableFormatter::new(fields, true);
         formatter.print_row(&["'x'".to_string()], "test");
