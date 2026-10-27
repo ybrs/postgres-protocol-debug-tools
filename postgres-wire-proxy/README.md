@@ -8,6 +8,7 @@ A simple, transparent PostgreSQL wire protocol proxy written in Rust. This tool 
 - **Protocol Message Parsing**: Logs all PostgreSQL wire protocol messages in human-readable format
 - **Hex Byte Dumps**: Every message includes a hex dump with offset, hex bytes, and ASCII representation
 - **SSL Termination**: Optional SSL/TLS support for client connections
+- **Table Mode**: Renders result sets as formatted tables, optionally sized to their content
 - **Dual Logging**: Logs to both stdout and optional file simultaneously
 - **Simple Text Format**: Easy-to-read log output without complexity
 - **Configurable**: All parameters (ports, hosts, SSL) configurable via CLI
@@ -75,10 +76,9 @@ When table mode is enabled:
 - **RowDescription** messages are still logged to show column metadata
 - **DataRow** messages are rendered as formatted table rows with:
   - Column headers from RowDescription
-  - Automatic column width adjustment based on content
+  - Fixed-width columns: every column is 15 characters wide, whatever it holds
   - Unicode box-drawing characters for borders
-  - Terminal width awareness (responsive to screen size)
-  - Graceful truncation with ellipsis for oversized content
+  - Graceful truncation with ellipsis for values longer than a column
 
 Example output with `--table`:
 ```
@@ -88,9 +88,9 @@ Example output with `--table`:
 [127.0.0.1:57985] ┌───────────────┬───────────────┐
 [127.0.0.1:57985] │id             │name           │
 [127.0.0.1:57985] ├───────────────┼───────────────┤
-[127.0.0.1:57985] │1              │Alice          │
-[127.0.0.1:57985] │2              │Bob            │
-[127.0.0.1:57985] │3              │Charlie        │
+[127.0.0.1:57985] │'1'            │'Alice'        │
+[127.0.0.1:57985] │'2'            │'Bob'          │
+[127.0.0.1:57985] │'3'            │'Charlie'      │
 [127.0.0.1:57985] └───────────────┴───────────────┘
 ```
 
@@ -98,8 +98,54 @@ Table mode features:
 - **Streaming**: Rows are printed as they arrive (no buffering)
 - **Fixed-width columns**: Each column is 15 characters wide for consistent alignment
 - **Automatic truncation**: Values longer than 15 characters are truncated with "..."
-- **NULL handling**: NULL values are displayed as-is in the table
+- **NULL handling**: NULL values are rendered as the text `NULL`
 - **Multi-column support**: Handles any number of columns from the query
+
+#### Dynamic column widths
+
+`--table-dynamic-width` sizes each column to the widest thing in it - header or
+value - instead of the fixed 15 characters, then caps the whole table to the
+terminal width. It requires `--table`:
+
+```bash
+./target/release/postgres-wire-proxy --table --table-dynamic-width
+```
+
+```
+[127.0.0.1:34910] ┌─────┬────────────────────┐
+[127.0.0.1:34910] │id   │name                │
+[127.0.0.1:34910] ├─────┼────────────────────┤
+[127.0.0.1:34910] │'1'  │'Bob'               │
+[127.0.0.1:34910] │'2'  │'a much longer name'│
+[127.0.0.1:34910] │'3'  │'ünïcødé'           │
+[127.0.0.1:34910] └─────┴────────────────────┘
+```
+
+The same query with `COLUMNS=20`, where the name column no longer fits:
+
+```
+[127.0.0.1:34918] ┌─────┬────────────┐
+[127.0.0.1:34918] │id   │name        │
+[127.0.0.1:34918] ├─────┼────────────┤
+[127.0.0.1:34918] │'1'  │'Bob'       │
+[127.0.0.1:34918] │'2'  │'a much l...│
+[127.0.0.1:34918] │'3'  │'ünïcødé'   │
+[127.0.0.1:34918] └─────┴────────────┘
+```
+
+How it behaves:
+- No column is narrower than 5 characters, which holds a few characters plus the
+  truncation ellipsis. When the terminal is too narrow to hold every column at
+  that floor, the floor wins and the table is wider than the terminal.
+- Over budget, the widest column is shaved one character at a time, so the
+  columns that need the room keep it. Values that no longer fit are truncated
+  with `...`.
+- The cap is `$COLUMNS` when set, otherwise 120 when stdout is a terminal. If
+  output is redirected - a log file, a pipe - there is no width to respect and
+  columns keep their content width.
+- **Rows are buffered**: the widest cell of a column is only known once the
+  result set ends, so the table is printed when `CommandComplete` arrives. The
+  default `--table` mode streams instead, and is better for large result sets.
 
 ### All Options
 
@@ -115,51 +161,55 @@ Options:
       --log-format <LOG_FORMAT>        Log format (full, short, bare) [default: full]
       --no-hex-dump                    Exclude hex dumps of wire data in logs
       --table                          Enable table formatting for DataRow output
+      --table-dynamic-width            Size table columns to their content instead of
+                                       the fixed 15 characters (requires --table)
   -h, --help                           Print help
   -V, --version                        Print version
 ```
 
 ## Example Log Output
 
-Each protocol message is logged with both human-readable description and hex dump:
+Each protocol message is logged with both human-readable description and hex dump.
+Shown here with `--log-format bare`, which leaves out the timestamp, level and
+module prefix:
 
 ```
-INFO postgres_wire_proxy: PostgreSQL proxy listening on 127.0.0.1:5466 (non-SSL)
-INFO postgres_wire_proxy: Forwarding to localhost:5432
-INFO postgres_wire_proxy: New connection from 127.0.0.1:54171
-INFO postgres_wire_proxy: [127.0.0.1:54171] Client requesting SSL
-INFO postgres_wire_proxy: [127.0.0.1:54171] SSL rejected (not configured)
-INFO postgres_wire_proxy: [127.0.0.1:54171] Connecting to upstream localhost:5432
-INFO postgres_wire_proxy: [127.0.0.1:54171] Connected to upstream
-INFO postgres_wire_proxy: [127.0.0.1:54171] → Startup message (length: 8)
+PostgreSQL proxy listening on 127.0.0.1:5466 (non-SSL)
+Forwarding to localhost:5432
+New connection from 127.0.0.1:54171
+[127.0.0.1:54171] Client requesting SSL
+[127.0.0.1:54171] SSL rejected (not configured)
+[127.0.0.1:54171] Connecting to upstream localhost:5432
+[127.0.0.1:54171] Connected to upstream
+[127.0.0.1:54171] → Startup message (length: 104)
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← Authentication: AuthenticationOk
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 52 00 00 00 08 00 00 00 00                        R........
+[127.0.0.1:54171] ← Authentication: AuthenticationOk
+[127.0.0.1:54171]   0000: 52 00 00 00 08 00 00 00 00                        R........
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← BackendKeyData
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 4b 00 00 00 0c 00 00 8c 2b f5 ae f8 8d            K.......+....
+[127.0.0.1:54171] ← BackendKeyData
+[127.0.0.1:54171]   0000: 4b 00 00 00 0c 00 00 8c 2b f5 ae f8 8d            K.......+....
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← ReadyForQuery (idle)
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 5a 00 00 00 05 49                                 Z....I
+[127.0.0.1:54171] ← ReadyForQuery (idle)
+[127.0.0.1:54171]   0000: 5a 00 00 00 05 49                                 Z....I
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] → Query: SELECT 42 as answer;
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 51 00 00 00 19 53 45 4c 45 43 54 20 34 32 20 61   Q....SELECT 42 a
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0010: 73 20 61 6e 73 77 65 72 3b 00                     s answer;.
+[127.0.0.1:54171] → Query: SELECT 42 as answer;
+[127.0.0.1:54171]   0000: 51 00 00 00 19 53 45 4c 45 43 54 20 34 32 20 61   Q....SELECT 42 a
+[127.0.0.1:54171]   0010: 73 20 61 6e 73 77 65 72 3b 00                     s answer;.
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← RowDescription (1 fields)
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 54 00 00 00 1f 00 01 61 6e 73 77 65 72 00 00 00   T......answer...
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0010: 00 00 00 00 00 00 00 17 00 04 ff ff ff ff 00 00   ................
+[127.0.0.1:54171] ← RowDescription (1 fields)
+[127.0.0.1:54171]   0000: 54 00 00 00 1f 00 01 61 6e 73 77 65 72 00 00 00   T......answer...
+[127.0.0.1:54171]   0010: 00 00 00 00 00 00 00 17 00 04 ff ff ff ff 00 00   ................
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← DataRow (1 fields, 8 bytes)
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 44 00 00 00 0c 00 01 00 00 00 02 34 32            D..........42
+[127.0.0.1:54171] ← DataRow (1 fields, 8 bytes)
+[127.0.0.1:54171]   0000: 44 00 00 00 0c 00 01 00 00 00 02 34 32            D..........42
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] ← CommandComplete: SELECT 1
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 43 00 00 00 0d 53 45 4c 45 43 54 20 31 00         C....SELECT 1.
+[127.0.0.1:54171] ← CommandComplete: SELECT 1
+[127.0.0.1:54171]   0000: 43 00 00 00 0d 53 45 4c 45 43 54 20 31 00         C....SELECT 1.
 
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171] → Terminate
-INFO postgres_wire_proxy::protocol: [127.0.0.1:54171]   0000: 58 00 00 00 04                                    X....
+[127.0.0.1:54171] → Terminate
+[127.0.0.1:54171]   0000: 58 00 00 00 04                                    X....
 
-INFO postgres_wire_proxy: [127.0.0.1:54171] Connection closed
+[127.0.0.1:54171] Connection closed (session 0.004s)
 ```
 
 The hex dump format shows:
@@ -241,9 +291,13 @@ psql -h localhost -p 5466 -U myuser -d mydb
 psql "postgresql://myuser:mypass@localhost:5466/mydb"
 ```
 
+No server around? `scripts/postgres.sh start` from the repository root brings up a
+rootless PostgreSQL 18 in `.pg/`; see
+[Real PostgreSQL for manual testing](../README.md#real-postgresql-for-manual-testing).
+
 ## Notes
 
-- The proxy creates a new upstream connection for each client connection (no connection pooling)
+- Each client connection gets its own upstream connection, one to one, with no pooling: a client session and the upstream session it stands for stay the same thing, which is what makes the log a faithful trace of one session
 - Logs are written to stdout with ANSI colors and to file without colors
 - SSL termination happens at the proxy; upstream connection is non-SSL
 - The proxy does not modify any protocol messages, it only observes and logs them

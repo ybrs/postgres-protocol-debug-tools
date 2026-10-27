@@ -1,6 +1,7 @@
+use bytes::{Buf, BytesMut};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::table_formatter::{FieldInfo, TableState};
 
@@ -98,39 +99,102 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    pub fn new(table_mode: bool) -> Self {
+    /// `dynamic_width` only matters when `table_mode` is on: it sizes table
+    /// columns to their content instead of the fixed width.
+    pub fn new(table_mode: bool, dynamic_width: bool) -> Self {
         Self {
-            table_state: TableState::new(table_mode),
+            table_state: TableState::new(table_mode, dynamic_width),
         }
     }
 }
 
+/// Largest number of bytes buffered while waiting for a message to finish
+/// arriving.
+///
+/// A message claiming to be larger than this is not decoded: the buffer is
+/// dropped and a warning is logged, because once a stream has been misread there
+/// is no way to tell where the next message starts.
+const MAX_DECODE_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Decode the messages in `pending`, which holds the bytes received on this
+/// connection so far (the caller appends every read to it).
+///
+/// The bytes of a message that has not fully arrived stay in `pending` for the
+/// next call, so a message split over several reads - or simply larger than the
+/// read buffer - is decoded once its last byte arrives. Only whole messages are
+/// consumed. Returns the number of bytes left buffered.
 pub fn parse_message(
-    data: &[u8],
+    pending: &mut BytesMut,
     direction: MessageDirection,
     client_addr: &str,
     timings: Option<&ConnectionTiming>,
     client_state: &ClientState,
     hex_dump: bool,
-) {
-    let mut buf = data;
+) -> usize {
+    parse_buffered(
+        pending,
+        MAX_DECODE_BUFFER,
+        direction,
+        client_addr,
+        timings,
+        client_state,
+        hex_dump,
+    )
+}
+
+fn parse_buffered(
+    pending: &mut BytesMut,
+    max_buffer: usize,
+    direction: MessageDirection,
+    client_addr: &str,
+    timings: Option<&ConnectionTiming>,
+    client_state: &ClientState,
+    hex_dump: bool,
+) -> usize {
+    if pending.len() > max_buffer {
+        warn!(
+            "[{}] {} bytes buffered without completing a message, giving up on decoding this connection",
+            client_addr,
+            pending.len()
+        );
+        pending.clear();
+        return 0;
+    }
+
     let arrow = match direction {
         MessageDirection::ClientToServer => "→",
         MessageDirection::ServerToClient => "←",
     };
 
-    while buf.len() >= 5 {
-        let msg_type = buf[0] as char;
-        let length = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let mut offset = 0;
+    let mut skipped = 0;
 
-        if buf.len() < length + 1 {
-            // Incomplete message
+    while pending.len() - offset >= 5 {
+        let msg_type = pending[offset] as char;
+        let length = u32::from_be_bytes([
+            pending[offset + 1],
+            pending[offset + 2],
+            pending[offset + 3],
+            pending[offset + 4],
+        ]) as usize;
+
+        // The length covers itself plus the body, so a smaller value is not a
+        // message header: step over the byte and look for the next one instead of
+        // slicing past the end of the buffer.
+        if length < 4 {
+            offset += 1;
+            skipped += 1;
+            continue;
+        }
+
+        if pending.len() - offset < length + 1 {
+            // Incomplete message: wait for the rest of it.
             break;
         }
 
         // Full message including type byte and length
-        let full_message = &buf[..length + 1];
-        let msg_data = &buf[5..length + 1];
+        let full_message = &pending[offset..offset + length + 1];
+        let msg_data = &pending[offset + 5..offset + length + 1];
 
         match direction {
             MessageDirection::ClientToServer => {
@@ -146,18 +210,21 @@ pub fn parse_message(
             log_hex_dump(full_message, client_addr);
         }
 
-        buf = &buf[length + 1..];
+        offset += length + 1;
     }
 
-    // If there's remaining data that doesn't form a complete message
-    if !buf.is_empty() && buf.len() < 5 {
-        info!(
-            "[{}] {} Partial message ({} bytes)",
-            client_addr,
-            arrow,
-            buf.len()
+    if skipped > 0 {
+        warn!(
+            "[{}] {} skipped {} byte(s) that do not start a message",
+            client_addr, arrow, skipped
         );
     }
+
+    if offset > 0 {
+        pending.advance(offset);
+    }
+
+    pending.len()
 }
 
 fn log_hex_dump(data: &[u8], client_addr: &str) {
@@ -853,9 +920,11 @@ fn parse_data_row(data: &[u8]) -> Option<Vec<String>> {
             // Try to display as UTF-8 string, otherwise show hex
             match std::str::from_utf8(value_bytes) {
                 Ok(s) => {
-                    // Truncate long values
+                    // Truncate long values, without cutting a multi-byte
+                    // character in half.
                     if s.len() > 100 {
-                        values.push(format!("'{}...' ({} bytes)", &s[..100], s.len()));
+                        let end = truncate_index(s, 100);
+                        values.push(format!("'{}...' ({} bytes)", &s[..end], s.len()));
                     } else {
                         values.push(format!("'{}'", s));
                     }
@@ -887,6 +956,16 @@ fn parse_data_row(data: &[u8]) -> Option<Vec<String>> {
     } else {
         Some(values)
     }
+}
+
+/// The largest index no greater than `max` that falls on a character boundary,
+/// so `&s[..index]` never splits a multi-byte character.
+fn truncate_index(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn get_pg_type_name(oid: u32) -> &'static str {
@@ -1156,5 +1235,138 @@ mod tests {
             summary.contains("ResultFormats=[text, binary]"),
             "summary missing per-column formats: {summary}"
         );
+    }
+
+    fn message_bytes(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut message = vec![tag];
+        message.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        message.extend_from_slice(body);
+        message
+    }
+
+    #[test]
+    fn message_split_across_reads_is_decoded_once_complete() {
+        let mut pending = BytesMut::new();
+        let state = ClientState::new(false, false);
+        let query = message_bytes(b'Q', b"select 1\0");
+
+        let (head, tail) = query.split_at(3);
+        pending.extend_from_slice(head);
+        let buffered = parse_message(
+            &mut pending,
+            MessageDirection::ClientToServer,
+            "test",
+            None,
+            &state,
+            false,
+        );
+        assert_eq!(buffered, 3, "an incomplete message stays buffered");
+
+        pending.extend_from_slice(tail);
+        let buffered = parse_message(
+            &mut pending,
+            MessageDirection::ClientToServer,
+            "test",
+            None,
+            &state,
+            false,
+        );
+        assert_eq!(
+            buffered, 0,
+            "the message is consumed once its last byte arrives"
+        );
+    }
+
+    #[test]
+    fn message_larger_than_a_read_buffer_is_decoded() {
+        let mut pending = BytesMut::new();
+        let state = ClientState::new(false, false);
+
+        // A DataRow with a 20 KB value, arriving in pieces the size the proxy
+        // reads with.
+        let mut body = 1u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&20_000i32.to_be_bytes());
+        body.extend_from_slice(&[b'x'; 20_000]);
+        let row = message_bytes(b'D', &body);
+
+        let mut buffered = row.len();
+        for chunk in row.chunks(8192) {
+            pending.extend_from_slice(chunk);
+            buffered = parse_message(
+                &mut pending,
+                MessageDirection::ServerToClient,
+                "test",
+                None,
+                &state,
+                false,
+            );
+        }
+
+        assert_eq!(
+            buffered, 0,
+            "the whole row is consumed once its last piece arrives"
+        );
+    }
+
+    #[test]
+    fn invalid_message_length_is_skipped_instead_of_panicking() {
+        // A length below 4 is impossible in a real message and used to slice
+        // past the end of the buffer.
+        let mut pending = BytesMut::new();
+        let state = ClientState::new(false, false);
+
+        pending.extend_from_slice(&[b'Q', 0, 0, 0, 0]);
+        let buffered = parse_message(
+            &mut pending,
+            MessageDirection::ClientToServer,
+            "test",
+            None,
+            &state,
+            false,
+        );
+
+        assert_eq!(buffered, 4, "the byte with the invalid length is skipped");
+    }
+
+    #[test]
+    fn decoder_state_is_dropped_when_a_message_never_completes() {
+        let mut pending = BytesMut::new();
+        let state = ClientState::new(false, false);
+
+        // Claims to be about 2 GiB and then goes quiet: the buffer must not grow
+        // without bound while waiting for it.
+        pending.extend_from_slice(&[b'D', 0x7f, 0xff, 0xff, 0xff]);
+        pending.extend_from_slice(&[0u8; 128]);
+
+        let buffered = parse_buffered(
+            &mut pending,
+            64,
+            MessageDirection::ServerToClient,
+            "test",
+            None,
+            &state,
+            false,
+        );
+
+        assert_eq!(buffered, 0);
+    }
+
+    #[test]
+    fn long_multibyte_values_are_truncated_on_a_character_boundary() {
+        // 120 bytes, 60 characters: cutting at byte 100 would split a character.
+        let value = "é".repeat(60);
+        let mut body = 1u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        body.extend_from_slice(value.as_bytes());
+
+        let values = parse_data_row(&body).expect("row parsed");
+
+        assert_eq!(values.len(), 1);
+        assert!(
+            values[0].contains("(120 bytes)"),
+            "unexpected value: {}",
+            values[0]
+        );
+        assert_eq!(values[0].matches('é').count(), 50);
     }
 }

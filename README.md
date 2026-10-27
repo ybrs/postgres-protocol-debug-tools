@@ -60,13 +60,17 @@ Result output with `--table`:
 [127.0.0.1:57985] ┌───────────────┬───────────────┐
 [127.0.0.1:57985] │id             │name           │
 [127.0.0.1:57985] ├───────────────┼───────────────┤
-[127.0.0.1:57985] │1              │Alice          │
-[127.0.0.1:57985] │2              │Bob            │
+[127.0.0.1:57985] │'1'            │'Alice'        │
+[127.0.0.1:57985] │'2'            │'Bob'          │
 [127.0.0.1:57985] └───────────────┴───────────────┘
 [127.0.0.1:57985] ← CommandComplete: SELECT 2
 ```
 
 Each column is fixed at 15 characters with automatic truncation for longer values.
+Add `--table-dynamic-width` (which requires `--table`) to size columns to their
+content instead, capped to the terminal width; rows are then buffered until the
+result set completes, so the default stays streaming. See
+[the proxy README](postgres-wire-proxy/README.md#dynamic-column-widths).
 
 You can point the upstream to your postgres compatible database and see the request responses in a human readable way.
 
@@ -209,6 +213,44 @@ row 0:
   0 (?column? / binary): text:''
 command tag: SELECT 1
 ```
+
+## Real PostgreSQL for manual testing
+
+No root, no Docker and no system packages are needed. `scripts/postgres.sh` unpacks a
+prebuilt PostgreSQL 18 distribution (server **and** `psql`) under `.pg/` and creates its
+cluster there; the whole directory is gitignored.
+
+```bash
+scripts/postgres.sh start     # first run downloads ~40 MB, runs initdb, starts on 127.0.0.1:5432
+export PATH="$PWD/.pg/vendor/full/bin:$PATH"   # psql, pg_dump, pg_isready, ...
+cargo run -p postgres-wire-proxy -- --table --no-hex-dump --log-file proxy.log
+scripts/postgres.sh psql      # a session straight to the server
+psql "postgresql://postgres:postgres@127.0.0.1:5466/postgres"   # the same, through the proxy
+scripts/postgres.sh stop
+```
+
+Defaults, each overridable by an environment variable:
+
+| | |
+| --- | --- |
+| port | `5432` (`PG_PORT`) — keep it equal to the proxy's `--upstream-port` |
+| user / password / database | `postgres` / `postgres` / `postgres` (`PG_USER`, `PG_PASSWORD`) |
+| version | PostgreSQL 18.6.1 (`PG_VERSION`) |
+| data, log, sockets | `.pg/data`, `.pg/server.log`, `.pg/run` |
+
+Worth knowing:
+
+- TCP uses `scram-sha-256`, so a session through the proxy shows the whole
+  `AuthenticationSASL` exchange and the client's `PasswordMessage`s. The unix socket
+  uses `trust`, so `scripts/postgres.sh psql` needs no password.
+- `ssl` is off, so a client's `SSLRequest` is answered `N` — the proxy's plaintext
+  path. Pass `--ssl-cert`/`--ssl-key` to the proxy to exercise TLS termination.
+- Rows bigger than the proxy's 8 KiB read buffer arrive split by construction, e.g.
+  `psql "postgresql://postgres:postgres@127.0.0.1:5466/postgres" -c "select repeat('x', 20000)"`.
+- `rm -rf .pg` starts over from a fresh download.
+
+The distribution comes from [theseus-rs/postgresql-binaries](https://github.com/theseus-rs/postgresql-binaries)
+and the download is checked against its published SHA-256.
 
 ## Make Targets
 

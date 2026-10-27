@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
@@ -61,6 +61,12 @@ struct Args {
     /// Enable table formatting for DataRow output
     #[arg(long)]
     table: bool,
+
+    /// Size table columns to their content instead of the fixed 15 characters.
+    /// Rows are held back until the result set finishes, and the table is capped
+    /// to the terminal width (or $COLUMNS)
+    #[arg(long, requires = "table")]
+    table_dynamic_width: bool,
 }
 
 #[tokio::main]
@@ -100,6 +106,7 @@ async fn main() -> Result<()> {
     );
     let hex_dump = args.hex_dump;
     let table_mode = args.table;
+    let table_dynamic_width = args.table_dynamic_width;
 
     loop {
         let (client_socket, client_addr) = listener.accept().await?;
@@ -110,6 +117,7 @@ async fn main() -> Result<()> {
         let ssl_config = ssl_config.clone();
         let hex_dump = hex_dump;
         let table_mode = table_mode;
+        let table_dynamic_width = table_dynamic_width;
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -120,6 +128,7 @@ async fn main() -> Result<()> {
                 ssl_config,
                 hex_dump,
                 table_mode,
+                table_dynamic_width,
             )
             .await
             {
@@ -152,6 +161,61 @@ fn load_ssl_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<Arc<rustls
     Ok(Arc::new(config))
 }
 
+/// Length the server itself accepts for a startup packet; also stops a bogus
+/// length from allocating an enormous buffer.
+const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
+
+/// Protocol code a client sends to ask for TLS.
+const SSL_REQUEST: u32 = 80877103;
+
+/// Read one startup packet: the 4-byte length, the 4-byte protocol version (or
+/// SSL request code) and the body that follows.
+///
+/// The whole packet is read rather than however many bytes one read returns, so
+/// that no startup bytes are left behind for the message decoder to mistake for
+/// protocol messages. Returns `None` when the peer went away or sent a length
+/// that cannot be a startup packet.
+async fn read_startup_packet<S>(stream: &mut S, client_addr: &str) -> Result<Option<BytesMut>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut header = [0u8; 8];
+    if let Err(e) = stream.read_exact(&mut header).await {
+        warn!("[{}] Client disconnected during startup: {}", client_addr, e);
+        return Ok(None);
+    }
+
+    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if !(8..=MAX_STARTUP_PACKET_LENGTH).contains(&length) {
+        warn!("[{}] Invalid startup packet length {}", client_addr, length);
+        return Ok(None);
+    }
+
+    let mut packet = BytesMut::with_capacity(length);
+    packet.extend_from_slice(&header);
+    if length > 8 {
+        packet.resize(length, 0);
+        stream
+            .read_exact(&mut packet[8..length])
+            .await
+            .context("Failed to read startup packet body")?;
+    }
+
+    Ok(Some(packet))
+}
+
+/// Report bytes that never completed a protocol message, so a truncated stream
+/// shows up in the log instead of silently missing from it.
+fn log_undecoded(buf: &BytesMut, client_addr: &str) {
+    if !buf.is_empty() {
+        info!(
+            "[{}] {} byte(s) in an incomplete trailing message",
+            client_addr,
+            buf.len()
+        );
+    }
+}
+
 async fn handle_connection(
     mut client_socket: TcpStream,
     client_addr: String,
@@ -160,34 +224,23 @@ async fn handle_connection(
     ssl_config: Option<Arc<rustls::ServerConfig>>,
     hex_dump: bool,
     table_mode: bool,
+    table_dynamic_width: bool,
 ) -> Result<()> {
-    // Check if client wants SSL
-    let mut startup_buf = BytesMut::with_capacity(8);
-    client_socket
-        .read_buf(&mut startup_buf)
-        .await
-        .context("Failed to read startup")?;
-
-    if startup_buf.len() < 8 {
-        warn!("Client disconnected during startup");
+    // Read the startup packet whole. Leaving part of it in the socket would hand
+    // startup bytes to the message decoder, which would read them as protocol
+    // messages and lose the framing of everything that follows.
+    let Some(startup_packet) = read_startup_packet(&mut client_socket, &client_addr).await? else {
         return Ok(());
-    }
+    };
 
-    let _length = u32::from_be_bytes([
-        startup_buf[0],
-        startup_buf[1],
-        startup_buf[2],
-        startup_buf[3],
-    ]);
     let protocol = u32::from_be_bytes([
-        startup_buf[4],
-        startup_buf[5],
-        startup_buf[6],
-        startup_buf[7],
+        startup_packet[4],
+        startup_packet[5],
+        startup_packet[6],
+        startup_packet[7],
     ]);
 
-    // SSL request code is 80877103
-    if protocol == 80877103 {
+    if protocol == SSL_REQUEST {
         info!("[{}] Client requesting SSL", client_addr);
 
         if let Some(config) = ssl_config {
@@ -203,12 +256,11 @@ async fn handle_connection(
 
             info!("[{}] SSL handshake complete", client_addr);
 
-            // Now read the actual startup message
-            startup_buf.clear();
-            tls_stream
-                .read_buf(&mut startup_buf)
-                .await
-                .context("Failed to read startup after SSL")?;
+            // The client sends the real startup packet over TLS next.
+            let Some(startup_buf) = read_startup_packet(&mut tls_stream, &client_addr).await?
+            else {
+                return Ok(());
+            };
 
             // Connect to upstream and proxy with TLS stream
             return proxy_with_tls(
@@ -219,6 +271,7 @@ async fn handle_connection(
                 upstream_port,
                 hex_dump,
                 table_mode,
+                table_dynamic_width,
             )
             .await;
         } else {
@@ -226,24 +279,37 @@ async fn handle_connection(
             client_socket.write_all(&[b'N']).await?;
             info!("[{}] SSL rejected (not configured)", client_addr);
 
-            // Now read the actual startup message
-            startup_buf.clear();
-            client_socket
-                .read_buf(&mut startup_buf)
-                .await
-                .context("Failed to read startup after SSL rejection")?;
+            // The SSL request carries no body of its own, so the real startup
+            // packet follows in the clear.
+            let Some(startup_buf) = read_startup_packet(&mut client_socket, &client_addr).await?
+            else {
+                return Ok(());
+            };
+
+            return proxy_with_tcp(
+                client_socket,
+                startup_buf,
+                client_addr,
+                upstream_host,
+                upstream_port,
+                hex_dump,
+                table_mode,
+                table_dynamic_width,
+            )
+            .await;
         }
     }
 
-    // Non-SSL path
+    // Non-SSL path: what was read is the startup packet itself.
     proxy_with_tcp(
         client_socket,
-        startup_buf,
+        startup_packet,
         client_addr,
         upstream_host,
         upstream_port,
         hex_dump,
         table_mode,
+        table_dynamic_width,
     )
     .await
 }
@@ -256,6 +322,7 @@ async fn proxy_with_tls(
     upstream_port: u16,
     hex_dump: bool,
     table_mode: bool,
+    table_dynamic_width: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -275,6 +342,7 @@ async fn proxy_with_tls(
         client_addr,
         hex_dump,
         table_mode,
+        table_dynamic_width,
     )
     .await
 }
@@ -287,6 +355,7 @@ async fn proxy_with_tcp(
     upstream_port: u16,
     hex_dump: bool,
     table_mode: bool,
+    table_dynamic_width: bool,
 ) -> Result<()> {
     // Connect to upstream
     info!(
@@ -306,6 +375,7 @@ async fn proxy_with_tcp(
         client_addr,
         hex_dump,
         table_mode,
+        table_dynamic_width,
     )
     .await
 }
@@ -317,6 +387,7 @@ async fn run_proxy<C>(
     client_addr: String,
     hex_dump: bool,
     table_mode: bool,
+    table_dynamic_width: bool,
 ) -> Result<()>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
@@ -333,15 +404,18 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut upstream_read, mut upstream_write) = upstream_socket.into_split();
     let timings = Arc::new(ConnectionTiming::new());
-    let client_state = Arc::new(ClientState::new(table_mode));
+    let client_state = Arc::new(ClientState::new(table_mode, table_dynamic_width));
 
     let client_addr_clone = client_addr.clone();
     let timings_clone = timings.clone();
     let client_state_clone = client_state.clone();
     let client_to_upstream = tokio::spawn(async move {
+        // A message that has not fully arrived stays in `buf` for the next read,
+        // so one split over several reads is still decoded. Leaving it there is
+        // safe for forwarding: everything already in `buf` has been written out.
         let mut buf = BytesMut::with_capacity(8192);
         loop {
-            buf.clear();
+            let handled = buf.len();
             match client_read.read_buf(&mut buf).await {
                 Ok(0) => {
                     info!(
@@ -349,24 +423,25 @@ where
                         client_addr_clone,
                         format_duration(timings_clone.session_elapsed())
                     );
+                    log_undecoded(&buf, &client_addr_clone);
                     break;
                 }
-                Ok(n) => {
+                Ok(_) => {
+                    // Forward before decoding, so logging cannot delay the proxy.
+                    if let Err(e) = upstream_write.write_all(&buf[handled..]).await {
+                        error!("[{}] Failed to write to upstream: {}", client_addr_clone, e);
+                        break;
+                    }
+
                     // Parse and log
                     parse_message(
-                        &buf[..n],
+                        &mut buf,
                         MessageDirection::ClientToServer,
                         &client_addr_clone,
                         Some(&*timings_clone),
                         &*client_state_clone,
                         hex_dump,
                     );
-
-                    // Forward to upstream
-                    if let Err(e) = upstream_write.write_all(&buf[..n]).await {
-                        error!("[{}] Failed to write to upstream: {}", client_addr_clone, e);
-                        break;
-                    }
                 }
                 Err(e) => {
                     error!("[{}] Failed to read from client: {}", client_addr_clone, e);
@@ -380,9 +455,10 @@ where
     let timings_clone = timings.clone();
     let client_state_clone = client_state.clone();
     let upstream_to_client = tokio::spawn(async move {
+        // As above: an incomplete message stays buffered for the next read.
         let mut buf = BytesMut::with_capacity(8192);
         loop {
-            buf.clear();
+            let handled = buf.len();
             match upstream_read.read_buf(&mut buf).await {
                 Ok(0) => {
                     info!(
@@ -390,24 +466,25 @@ where
                         client_addr_clone,
                         format_duration(timings_clone.session_elapsed())
                     );
+                    log_undecoded(&buf, &client_addr_clone);
                     break;
                 }
-                Ok(n) => {
+                Ok(_) => {
+                    // Forward before decoding, so logging cannot delay the proxy.
+                    if let Err(e) = client_write.write_all(&buf[handled..]).await {
+                        error!("[{}] Failed to write to client: {}", client_addr_clone, e);
+                        break;
+                    }
+
                     // Parse and log
                     parse_message(
-                        &buf[..n],
+                        &mut buf,
                         MessageDirection::ServerToClient,
                         &client_addr_clone,
                         Some(&*timings_clone),
                         &*client_state_clone,
                         hex_dump,
                     );
-
-                    // Forward to client
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        error!("[{}] Failed to write to client: {}", client_addr_clone, e);
-                        break;
-                    }
                 }
                 Err(e) => {
                     error!(
