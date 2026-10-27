@@ -16,3 +16,4 @@ bytes = "1.9"
 anyhow = "1.0"
 owo-colors = "4.1"
 time = { version = "0.3", features = ["formatting"] }
+webpki-roots = "1.0.11"

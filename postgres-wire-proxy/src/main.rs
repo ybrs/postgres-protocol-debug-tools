@@ -14,6 +14,8 @@ mod protocol;
 use protocol::{format_duration, parse_message, ClientState, ConnectionTiming, MessageDirection};
 mod logging;
 use logging::{setup_logging, LogFormat};
+mod upstream;
+use upstream::{BoxedUpstream, UpstreamSsl, UpstreamSslMode};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "PostgreSQL wire protocol proxy", long_about = None)]
@@ -67,6 +69,27 @@ struct Args {
     /// to the terminal width (or $COLUMNS)
     #[arg(long, requires = "table")]
     table_dynamic_width: bool,
+
+    /// How to ask the upstream for TLS: disable, prefer, require.
+    /// disable: never ask. prefer: ask, carry on in plaintext if refused.
+    /// require: ask, and treat a refusal as a connection error
+    #[arg(long, value_enum, default_value_t = UpstreamSslMode::default())]
+    upstream_ssl_mode: UpstreamSslMode,
+
+    /// Extra CA certificate (PEM) to verify the upstream against, for a private
+    /// or self-signed CA. Added to the bundled Mozilla roots
+    #[arg(long)]
+    upstream_ca_cert: Option<PathBuf>,
+
+    /// Name to verify the upstream certificate against and send as SNI.
+    /// Defaults to --upstream-host
+    #[arg(long)]
+    upstream_server_name: Option<String>,
+
+    /// Accept any upstream certificate: encrypt, but do not authenticate the
+    /// server. For debugging against a server you cannot add a CA for
+    #[arg(long)]
+    upstream_tls_insecure: bool,
 }
 
 #[tokio::main]
@@ -75,6 +98,32 @@ async fn main() -> Result<()> {
 
     // Setup logging
     setup_logging(args.log_file.as_ref(), args.log_format)?;
+
+    // These only mean something once there is TLS to configure; silently
+    // ignoring them would look like they had been applied.
+    if args.upstream_ssl_mode == UpstreamSslMode::Disable
+        && (args.upstream_ca_cert.is_some()
+            || args.upstream_server_name.is_some()
+            || args.upstream_tls_insecure)
+    {
+        anyhow::bail!(
+            "--upstream-ca-cert, --upstream-server-name and --upstream-tls-insecure have no \
+             effect with --upstream-ssl-mode disable"
+        );
+    }
+
+    let upstream_ssl = UpstreamSsl {
+        mode: args.upstream_ssl_mode,
+        ca_cert: args.upstream_ca_cert.clone(),
+        server_name: args.upstream_server_name.clone(),
+        insecure: args.upstream_tls_insecure,
+    };
+    if upstream_ssl.insecure && upstream_ssl.mode != UpstreamSslMode::Disable {
+        warn!(
+            "Upstream TLS certificate verification is off (--upstream-tls-insecure); \
+             the connection is encrypted but the server is not authenticated"
+        );
+    }
 
     // Validate SSL configuration
     let ssl_config = if let Some(cert_path) = &args.ssl_cert {
@@ -101,8 +150,10 @@ async fn main() -> Result<()> {
         info!("PostgreSQL proxy listening on {} (non-SSL)", listen_addr);
     }
     info!(
-        "Forwarding to {}:{}",
-        args.upstream_host, args.upstream_port
+        "Forwarding to {}:{} (upstream SSL: {})",
+        args.upstream_host,
+        args.upstream_port,
+        upstream_ssl.describe()
     );
     let hex_dump = args.hex_dump;
     let table_mode = args.table;
@@ -115,6 +166,7 @@ async fn main() -> Result<()> {
         let upstream_host = args.upstream_host.clone();
         let upstream_port = args.upstream_port;
         let ssl_config = ssl_config.clone();
+        let upstream_ssl = upstream_ssl.clone();
         let hex_dump = hex_dump;
         let table_mode = table_mode;
         let table_dynamic_width = table_dynamic_width;
@@ -126,6 +178,7 @@ async fn main() -> Result<()> {
                 upstream_host,
                 upstream_port,
                 ssl_config,
+                upstream_ssl,
                 hex_dump,
                 table_mode,
                 table_dynamic_width,
@@ -164,9 +217,6 @@ fn load_ssl_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<Arc<rustls
 /// Length the server itself accepts for a startup packet; also stops a bogus
 /// length from allocating an enormous buffer.
 const MAX_STARTUP_PACKET_LENGTH: usize = 10_000;
-
-/// Protocol code a client sends to ask for TLS.
-const SSL_REQUEST: u32 = 80877103;
 
 /// Read one startup packet: the 4-byte length, the 4-byte protocol version (or
 /// SSL request code) and the body that follows.
@@ -222,6 +272,7 @@ async fn handle_connection(
     upstream_host: String,
     upstream_port: u16,
     ssl_config: Option<Arc<rustls::ServerConfig>>,
+    upstream_ssl: UpstreamSsl,
     hex_dump: bool,
     table_mode: bool,
     table_dynamic_width: bool,
@@ -240,7 +291,7 @@ async fn handle_connection(
         startup_packet[7],
     ]);
 
-    if protocol == SSL_REQUEST {
+    if protocol == upstream::SSL_REQUEST_CODE {
         info!("[{}] Client requesting SSL", client_addr);
 
         if let Some(config) = ssl_config {
@@ -262,13 +313,14 @@ async fn handle_connection(
                 return Ok(());
             };
 
-            // Connect to upstream and proxy with TLS stream
-            return proxy_with_tls(
+            // Connect to upstream and proxy with the decrypted client stream
+            return proxy_connection(
                 tls_stream,
                 startup_buf,
                 client_addr,
                 upstream_host,
                 upstream_port,
+                upstream_ssl,
                 hex_dump,
                 table_mode,
                 table_dynamic_width,
@@ -286,12 +338,13 @@ async fn handle_connection(
                 return Ok(());
             };
 
-            return proxy_with_tcp(
+            return proxy_connection(
                 client_socket,
                 startup_buf,
                 client_addr,
                 upstream_host,
                 upstream_port,
+                upstream_ssl,
                 hex_dump,
                 table_mode,
                 table_dynamic_width,
@@ -301,12 +354,13 @@ async fn handle_connection(
     }
 
     // Non-SSL path: what was read is the startup packet itself.
-    proxy_with_tcp(
+    proxy_connection(
         client_socket,
         startup_packet,
         client_addr,
         upstream_host,
         upstream_port,
+        upstream_ssl,
         hex_dump,
         table_mode,
         table_dynamic_width,
@@ -314,57 +368,32 @@ async fn handle_connection(
     .await
 }
 
-async fn proxy_with_tls(
-    client_stream: tokio_rustls::server::TlsStream<TcpStream>,
+/// Connect to the backend and pump messages both ways. Generic over the client
+/// side, so the plaintext client and the TLS-terminated client share one path;
+/// the upstream side is boxed, because that is where TLS is negotiated.
+async fn proxy_connection<C>(
+    client_stream: C,
     startup_buf: BytesMut,
     client_addr: String,
     upstream_host: String,
     upstream_port: u16,
+    upstream_ssl: UpstreamSsl,
     hex_dump: bool,
     table_mode: bool,
     table_dynamic_width: bool,
-) -> Result<()> {
-    // Connect to upstream
+) -> Result<()>
+where
+    C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
     info!(
-        "[{}] Connecting to upstream {}:{}",
-        client_addr, upstream_host, upstream_port
-    );
-    let upstream_socket = TcpStream::connect(format!("{}:{}", upstream_host, upstream_port))
-        .await
-        .context("Failed to connect to upstream")?;
-
-    info!("[{}] Connected to upstream", client_addr);
-
-    run_proxy(
-        client_stream,
-        upstream_socket,
-        startup_buf,
+        "[{}] Connecting to upstream {}:{} (SSL: {})",
         client_addr,
-        hex_dump,
-        table_mode,
-        table_dynamic_width,
-    )
-    .await
-}
-
-async fn proxy_with_tcp(
-    client_stream: TcpStream,
-    startup_buf: BytesMut,
-    client_addr: String,
-    upstream_host: String,
-    upstream_port: u16,
-    hex_dump: bool,
-    table_mode: bool,
-    table_dynamic_width: bool,
-) -> Result<()> {
-    // Connect to upstream
-    info!(
-        "[{}] Connecting to upstream {}:{}",
-        client_addr, upstream_host, upstream_port
+        upstream_host,
+        upstream_port,
+        upstream_ssl.describe()
     );
-    let upstream_socket = TcpStream::connect(format!("{}:{}", upstream_host, upstream_port))
-        .await
-        .context("Failed to connect to upstream")?;
+    let upstream_socket =
+        upstream::connect(&upstream_host, upstream_port, &upstream_ssl, &client_addr).await?;
 
     info!("[{}] Connected to upstream", client_addr);
 
@@ -382,7 +411,7 @@ async fn proxy_with_tcp(
 
 async fn run_proxy<C>(
     client_stream: C,
-    mut upstream_socket: TcpStream,
+    mut upstream_socket: BoxedUpstream,
     startup_buf: BytesMut,
     client_addr: String,
     hex_dump: bool,
@@ -402,7 +431,7 @@ where
 
     // Proxy messages bidirectionally
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut upstream_read, mut upstream_write) = upstream_socket.into_split();
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_socket);
     let timings = Arc::new(ConnectionTiming::new());
     let client_state = Arc::new(ClientState::new(table_mode, table_dynamic_width));
 

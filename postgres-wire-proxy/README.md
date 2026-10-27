@@ -8,6 +8,7 @@ A simple, transparent PostgreSQL wire protocol proxy written in Rust. This tool 
 - **Protocol Message Parsing**: Logs all PostgreSQL wire protocol messages in human-readable format
 - **Hex Byte Dumps**: Every message includes a hex dump with offset, hex bytes, and ASCII representation
 - **SSL Termination**: Optional SSL/TLS support for client connections
+- **Upstream TLS**: Optional TLS to the backend, `disable`/`prefer`/`require`, verified against the bundled Mozilla roots or a CA of your own
 - **Table Mode**: Renders result sets as formatted tables, optionally sized to their content
 - **Dual Logging**: Logs to both stdout and optional file simultaneously
 - **Simple Text Format**: Easy-to-read log output without complexity
@@ -61,8 +62,80 @@ Logs will be written to both stdout and the specified file.
 When SSL is configured, the proxy will:
 1. Accept SSL connection requests from clients
 2. Perform SSL handshake using the provided certificate
-3. Forward decrypted traffic to upstream (non-SSL)
+3. Forward decrypted traffic to upstream (in plaintext, unless the upstream is asked for TLS as well)
 4. Log all decrypted protocol messages
+
+### Upstream TLS
+
+The proxy can also speak TLS to the backend. The default is what it always did:
+ask the server, and carry on in plaintext if it says no.
+
+```bash
+# The backend requires TLS and its certificate is signed by a private CA
+./target/release/postgres-wire-proxy --upstream-ca-cert /path/to/ca.pem
+
+# Refuse to talk to a backend that will not do TLS
+./target/release/postgres-wire-proxy --upstream-ssl-mode require
+
+# Never ask
+./target/release/postgres-wire-proxy --upstream-ssl-mode disable
+```
+
+How it behaves:
+
+- The proxy sends the 8-byte `SSLRequest` and reads the server's one-byte answer,
+  exactly as a client would, then wraps the socket in a rustls handshake. The
+  proxy still reads plaintext on both sides, because it terminates rather than
+  tunnels, so the log is unchanged.
+- **Certificates are verified by default**, against the bundled Mozilla roots
+  plus whatever `--upstream-ca-cert` adds, and the name is checked too:
+  `--upstream-server-name` overrides the name verified and sent as SNI, for a
+  backend reached by IP address or through a tunnel.
+- `--upstream-tls-insecure` accepts any certificate, and warns at startup. That
+  is encryption without authentication: for a server whose CA you cannot obtain.
+- `prefer` falls back only on a refusal (`N`). A certificate failure - or a
+  handshake that starts and fails - ends the connection; nothing is retried in
+  the clear.
+- `--upstream-ca-cert`, `--upstream-server-name` and `--upstream-tls-insecure`
+  are rejected with `--upstream-ssl-mode disable` rather than silently ignored.
+
+```
+[127.0.0.1:54171] Connecting to upstream localhost:5432 (SSL: prefer (verified))
+[127.0.0.1:54171] Upstream SSL: sent SSLRequest
+[127.0.0.1:54171] Upstream SSL: server agreed to TLS, handshaking (server name "localhost")
+[127.0.0.1:54171] Upstream TLS handshake complete
+```
+
+#### SCRAM channel binding through the proxy
+
+Before pointing this at a server that requires both TLS and password
+authentication, know this: once the backend connection is TLS, PostgreSQL offers
+`SCRAM-SHA-256-PLUS`, and a client whose own connection to the proxy is plaintext
+refuses it (psql 18.6, with the server offering both mechanisms):
+
+```
+psql: error: connection to server at "127.0.0.1", port 5466 failed:
+server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection
+```
+
+Channel binding hashes the certificate the client was shown, so for the client to
+satisfy it the proxy must present **the same certificate the backend does**, and
+the client must reach the proxy over TLS:
+
+```bash
+./target/release/postgres-wire-proxy \
+  --ssl-cert server.crt --ssl-key server.key \
+  --upstream-ca-cert ca.pem
+psql "postgresql://user@127.0.0.1:5466/db?sslmode=verify-full&sslrootcert=ca.pem"
+```
+
+With a certificate of its own the bindings differ, and the server rejects the
+login with `FATAL: SCRAM channel binding check failed`. A backend using an
+authentication method without channel binding avoids the whole issue.
+
+[`scripts/postgres.sh`](../README.md#real-postgresql-for-manual-testing) sets
+this up locally: `PG_SSL=on scripts/postgres.sh start` serves TLS from a CA it
+generates for you.
 
 ### Table Mode
 
@@ -163,6 +236,14 @@ Options:
       --table                          Enable table formatting for DataRow output
       --table-dynamic-width            Size table columns to their content instead of
                                        the fixed 15 characters (requires --table)
+      --upstream-ssl-mode <MODE>       How to ask the upstream for TLS: disable, prefer,
+                                       require [default: prefer]
+      --upstream-ca-cert <CA_CERT>     Extra CA certificate (PEM) to verify the upstream
+                                       against. Added to the bundled Mozilla roots
+      --upstream-server-name <NAME>    Name to verify the upstream certificate against
+                                       and send as SNI [default: --upstream-host]
+      --upstream-tls-insecure          Accept any upstream certificate: encrypt, but do
+                                       not authenticate the server
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -274,10 +355,12 @@ The proxy recognizes and logs the following PostgreSQL wire protocol messages:
 2. Proxy checks if client requests SSL
 3. If SSL configured and requested, proxy performs SSL handshake
 4. Proxy connects to upstream PostgreSQL server
-5. Proxy forwards startup message to upstream
-6. Proxy begins bidirectional message forwarding
-7. All messages are parsed and logged in real-time
-8. Connection closes when either side disconnects
+5. Unless `--upstream-ssl-mode disable`, the proxy sends an `SSLRequest` and, if
+the server agrees, performs a TLS handshake of its own with it
+6. Proxy forwards startup message to upstream
+7. Proxy begins bidirectional message forwarding
+8. All messages are parsed and logged in real-time
+9. Connection closes when either side disconnects
 
 ## Testing
 
@@ -299,5 +382,5 @@ rootless PostgreSQL 18 in `.pg/`; see
 
 - Each client connection gets its own upstream connection, one to one, with no pooling: a client session and the upstream session it stands for stay the same thing, which is what makes the log a faithful trace of one session
 - Logs are written to stdout with ANSI colors and to file without colors
-- SSL termination happens at the proxy; upstream connection is non-SSL
+- SSL termination happens at the proxy; the upstream connection follows `--upstream-ssl-mode`, so it is TLS when the server offers it and plaintext when it does not
 - The proxy does not modify any protocol messages, it only observes and logs them

@@ -133,10 +133,10 @@ another session's lines. Options, cheapest first:
 Recommendation: (1) unless logs are parsed programmatically; (2) if sessions
 actually need to be correlated.
 
-## 4. Upstream TLS — what it would need (**open**)
+## 4. Upstream TLS — the plan, and where it was wrong (implemented, §11)
 
-TLS is terminated for the client only; the proxy never sends an `SSLRequest`
-upstream. To talk to a TLS-requiring server:
+TLS used to be terminated for the client only; the proxy never sent an
+`SSLRequest` upstream. To talk to a TLS-requiring server:
 
 1. **Act as a TLS client upstream.** Send the 8-byte `SSLRequest` (code
    80877103), read the single `S`/`N` byte, and on `S` run a
@@ -153,17 +153,36 @@ upstream. To talk to a TLS-requiring server:
    today's behaviour by default.
 4. **Plumbing.** `proxy_with_tcp` / `proxy_with_tls` and `run_proxy` hardcode
    `TcpStream` upstream and call `into_split()`; a TLS upstream means making that
-   type generic or boxing it as
-   `Box<dyn AsyncRead + AsyncWrite + Unpin + Send>` and using `tokio::io::split`.
+   type generic or boxing it and using `tokio::io::split`.
 5. What does not change: the proxy still logs plaintext, because it terminates
    rather than tunnels.
+
+Three things in that plan did not survive contact:
+
+- **No `verify-full` mode.** rustls verifies the hostname as part of verifying
+  the certificate and has no `verify-ca` equivalent, so a separate mode would
+  have promised something the other modes did not already do. Trust is therefore
+  a property of the flags, not of the mode: verification is always on unless
+  `--upstream-tls-insecure` says otherwise, and the mode only decides what
+  happens when the server refuses. That also avoids libpq's trap of `require`
+  being *weaker* than `prefer`.
+- **`Box<dyn AsyncRead + AsyncWrite + Unpin + Send>` does not compile.** A trait
+  object may carry only one non-auto trait. The fix is a one-line blanket trait
+  (`trait UpstreamStream: AsyncRead + AsyncWrite + Unpin + Send {}`) and
+  `Box<dyn UpstreamStream>`.
+- **`proxy_with_tcp` and `proxy_with_tls` were the same function.** Threading
+  another parameter through both would have meant writing it twice; they are now
+  one `proxy_connection<C>`, generic over the client side.
+
+What the plan did not anticipate at all — that authenticating through a
+TLS-terminating proxy is a problem in its own right — is §11.
 
 ## 5. Answers to the specific questions
 
 ### 5.1 "Are you sure we don't have automatic column width?" — you do not, and never committed it
 
 The git record is unambiguous: `table_formatter.rs` was added whole in the single
-`--table format` commit (`0f4410e`, which is HEAD), and every width-related line
+`--table format` commit (`d4dbb4c`, now history rather than HEAD), and every width-related line
 in it is an addition. A dynamic-width version was never committed; the residue is
 from something uncommitted:
 
@@ -254,22 +273,30 @@ The `docs/*.png` screenshots are current; only the text block was behind.
   rustfmt violations (module ordering in `main.rs`, several long calls), so
   reformatting would bury this change in unrelated churn. Only the new test file
   is formatted.
-- **§3 and §4** are analysed but not implemented.
+- **§3** is analysed but not implemented. **§4** is implemented (§11).
 
 ## 8. Verifying
 
 ```sh
-cargo test --workspace        # 4 + 28 + 3 = 35 tests, exit 0
+cargo test --workspace        # 4 + 46 + 14 = 64 tests, exit 0
 ```
 
 To see the framing bug for yourself, that the fix is what matters:
 
 ```sh
 git stash push postgres-wire-proxy/src   # keep the new tests
-cargo test -p postgres-wire-proxy --test protocol_logging
-# 1 passed; 2 failed
+cargo test -p postgres-wire-proxy
+# 36 unit tests pass, upstream.rs not being compiled
+# test result: FAILED. 6 passed; 8 failed
+#   (the 2 framing tests, and every test that needs a flag added in §11)
 git stash pop
 ```
+
+The stash no longer isolates the framing bug: it takes the upstream TLS code with
+it, so those tests fail on the removed flags too. One of them still passes,
+because it asserts that a flag combination is *rejected* and an unrecognised flag
+is rejected as well. Before this branch's second change set the same command gave
+`1 passed; 2 failed`.
 
 ## 9. Manual verification against a real PostgreSQL server
 
@@ -279,7 +306,8 @@ packages: a prebuilt distribution from
 is unpacked under `.pg/`, the cluster is created there, and the SHA-256 of the
 download is verified. TCP auth is `scram-sha-256` (password `postgres`), the unix
 socket is `trust`, and `ssl` is off, so a client's `SSLRequest` is answered `N`
-and takes the proxy's plaintext path.
+and takes the proxy's plaintext path. `PG_SSL=on` serves TLS from a CA the script
+generates instead; §11 is what uses that.
 
 Verified with `psql` 18.6 through the proxy on `127.0.0.1:5466`, upstream
 `127.0.0.1:5432`:
@@ -324,3 +352,74 @@ end-to-end tests through the real binary: content sizing, the `COLUMNS=40` cap,
 and the `--table` requirement. Against the local PostgreSQL the same query
 renders 28 characters wide uncapped and exactly 20 with `COLUMNS=20`, where the
 long value becomes `'a much l...`.
+
+## 11. Upstream TLS (`--upstream-ssl-mode` and friends)
+
+`upstream.rs` is new; `main.rs` gained the flags and lost a duplicated function.
+
+| Flag | Meaning |
+| --- | --- |
+| `--upstream-ssl-mode disable` | Never send an `SSLRequest` |
+| `--upstream-ssl-mode prefer` | Ask; plaintext on `N` (default, as before) |
+| `--upstream-ssl-mode require` | Ask; a refusal is a connection error |
+| `--upstream-ca-cert <PEM>` | Trust anchor added to the bundled Mozilla roots |
+| `--upstream-server-name <name>` | Name verified and sent as SNI (default `--upstream-host`) |
+| `--upstream-tls-insecure` | Accept any certificate; warns at startup |
+
+The three trust flags are refused with `--upstream-ssl-mode disable`, so an
+option that cannot apply is an error rather than a silent no-op. Trust comes from
+`webpki-roots` (new dependency) plus the CA file; `prefer` falls back only on an
+`N`, and a failed handshake is never retried in the clear, which is the one place
+this deliberately differs from libpq.
+
+Tests: the negotiation cases run through the real binary against a fake upstream
+that answers `N` (`prefer` fallback, `require` fails and forwards nothing, and
+`disable` provably sends no `SSLRequest` at all, asserted on the first four bytes
+on the wire), plus a server that answers `S` and then speaks plaintext. The
+verification cases use a fake upstream that completes a real rustls handshake
+with an embedded test certificate, which is what makes the pair meaningful: with
+`--upstream-ca-cert` the session runs, and without it the handshake fails with
+`UnknownIssuer` - asserted, so a verifier that stopped verifying would fail the
+test rather than quietly pass it.
+
+### Against the real server
+
+`scripts/postgres.sh` gained `PG_SSL=on` and a `tls` command, generating a private
+CA and a server certificate into `.pg/tls`. With PostgreSQL 18.6 on
+`127.0.0.1:5432` and `psql` 18.6, `ssl` on, certificate signed by that CA:
+
+| Configuration | Observed |
+| --- | --- |
+| default (`prefer`, verified), no CA | `Upstream TLS handshake failed: invalid peer certificate: UnknownIssuer` |
+| `--upstream-ca-cert .pg/tls/ca.crt` | `Upstream TLS handshake complete` |
+| `--upstream-tls-insecure` | handshake completes, `verifying nothing` warned at startup |
+| `--upstream-server-name localhost` + CA | handshake completes (the certificate carries `DNS:localhost` and `IP:127.0.0.1`) |
+| `--upstream-server-name wrong.example.com` + CA | `certificate not valid for name "wrong.example.com"; certificate is only valid for DnsName("localhost") or IpAddress(127.0.0.1)` |
+| `--upstream-ssl-mode disable` | works; `pg_stat_ssl.ssl` for the upstream session is `f` |
+| `--upstream-ssl-mode require`, server `ssl = off` | `Upstream refused TLS, but --upstream-ssl-mode=require` |
+| default, server `ssl = off` | `Upstream SSL: server refused TLS, continuing in plaintext` |
+| client TLS + same cert as the server + CA | `1\|hi\|t\|TLSv1.3` - the query ran, and the upstream session is TLS |
+| client TLS + a different cert | `FATAL: SCRAM channel binding check failed` |
+
+In the working TLS sessions a 20 000-byte value came back intact, with zero
+`incomplete` warnings, and `--table --table-dynamic-width` rendered it - the same
+framing path §1.1 fixed, now over TLS records, where the split is structural.
+
+### What it exposed: channel binding
+
+An upstream on TLS makes PostgreSQL offer `SCRAM-SHA-256-PLUS`. The hex dump of
+the `AuthenticationSASL` message shows the server offering both mechanisms
+(`SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0`), yet psql 18.6 fails anyway when its own
+connection to the proxy is plaintext:
+
+```
+server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection
+```
+
+`channel_binding=disable` did not avoid it, as a URI parameter or as
+`PGCHANNELBINDING`. Since channel binding hashes the certificate the client was
+shown, the client passes only when the proxy presents the same certificate the
+backend does and the client reaches the proxy over TLS; a different certificate
+produces `FATAL: SCRAM channel binding check failed` instead. Both are verified
+above. It is a property of terminating TLS in front of SCRAM, not of this
+implementation - but it is the first thing a user hits, so it is in both READMEs.

@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustls::pki_types::CertificateDer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 /// How long a test waits for a line to show up in the proxy log.
 const LOG_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -190,18 +193,59 @@ fn spawn_upstream(script: impl FnOnce(&mut TcpStream) + Send + 'static) -> u16 {
     port
 }
 
+/// Protocol code a client sends to ask for TLS.
+const SSL_REQUEST_CODE: u32 = 80877103;
+
+/// Read the 8-byte packet the proxy opens with: an `SSLRequest`, or the start of
+/// the startup packet. Returns its protocol code and its total length.
+fn read_first_packet(stream: &mut TcpStream) -> (u32, usize) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut header = [0u8; 8];
+    stream
+        .read_exact(&mut header)
+        .expect("read the proxy's first packet");
+
+    (
+        u32::from_be_bytes(header[4..8].try_into().unwrap()),
+        u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize,
+    )
+}
+
+fn read_packet_body(stream: &mut TcpStream, length: usize) {
+    let mut body = vec![0u8; length - 8];
+    stream.read_exact(&mut body).expect("read packet body");
+}
+
 /// Read a whole startup packet: the 4-byte length, then the rest of the packet.
 ///
 /// One `read` is not enough - the kernel is free to hand a packet over in
 /// pieces - which is exactly what the proxy has to cope with too.
+///
+/// The proxy asks for TLS before its startup packet, so the `SSLRequest` is
+/// answered with 'N' first: that is what a server with `ssl = off` says, and it
+/// is the path the default `--upstream-ssl-mode prefer` falls back on.
 fn read_startup(stream: &mut TcpStream) {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut length = [0u8; 4];
-    stream.read_exact(&mut length).expect("read startup length");
-    let mut body = vec![0u8; u32::from_be_bytes(length) as usize - 4];
-    stream.read_exact(&mut body).expect("read startup body");
+    let (code, length) = read_first_packet(stream);
+    if code == SSL_REQUEST_CODE {
+        assert_eq!(length, 8, "an SSLRequest is 8 bytes");
+        stream.write_all(b"N").expect("refuse SSL");
+        stream.flush().unwrap();
+
+        let (_, length) = read_first_packet(stream);
+        read_packet_body(stream, length);
+    } else {
+        read_packet_body(stream, length);
+    }
+}
+
+/// Read a startup packet and assert no `SSLRequest` came first, which is what
+/// `--upstream-ssl-mode disable` has to look like on the wire.
+fn read_startup_without_ssl(stream: &mut TcpStream) {
+    let (code, length) = read_first_packet(stream);
+    assert_eq!(code, 196_608, "expected the startup packet, not an SSLRequest");
+    read_packet_body(stream, length);
 }
 
 /// Read one protocol message: the tag byte, the 4-byte length, then the body.
@@ -324,6 +368,165 @@ fn screenshot_upstream(
         stream.write_all(&batch).unwrap();
         stream.flush().unwrap();
     })
+}
+
+// ---------------------------------------------------------------------------
+// A TLS-capable fake upstream
+// ---------------------------------------------------------------------------
+
+/// The CA and server certificate the TLS tests use, generated once with openssl
+/// (the same pair `scripts/postgres.sh` uses for its `ssl = on` local server).
+/// The server key is a throwaway fixture that signs nothing but this certificate
+/// and exists only so these tests need no certificate tooling.
+const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBoTCCAUegAwIBAgIUIduDa5pZ0Ohl8vnY1gLDGb5KSoMwCgYIKoZIzj0EAwIw
+JjEkMCIGA1UEAwwbUG9zdGdyZXMgV2lyZSBQcm94eSBUZXN0IENBMB4XDTI2MTAy
+NzE2MzQzMloXDTM2MTAyNDE2MzQzMlowJjEkMCIGA1UEAwwbUG9zdGdyZXMgV2ly
+ZSBQcm94eSBUZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAESQ9jrjEK
+DGSDceJHmUt3Kqg1EfsIZXKwRKyGCQujL51380ZPy1a8sAVWf1smjpqZVfCJ+bnW
+hw/k92JG8BwfI6NTMFEwHQYDVR0OBBYEFAOOF/EPL17/odGsObzjJ0vBmYTGMB8G
+A1UdIwQYMBaAFAOOF/EPL17/odGsObzjJ0vBmYTGMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIgHFbJQ6ILMS5mAtBWAoScil7CJPUnrJodpoi4GLi7
+udsCIQCBGbzipoZe/D4b118NfHB7NdHhj412gke7VfJb3po/+Q==
+-----END CERTIFICATE-----
+";
+
+const TEST_SERVER_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIB0DCCAXWgAwIBAgIUSIwTnM2A/2Jcgjj+81zrTf+P5+YwCgYIKoZIzj0EAwIw
+JjEkMCIGA1UEAwwbUG9zdGdyZXMgV2lyZSBQcm94eSBUZXN0IENBMB4XDTI2MTAy
+NzE2MzQzMloXDTM2MTAyNDE2MzQzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkw
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEM7Fs+UwQyFtgChzD6eeIl4qapxX0L3Mj
+R4qnuBIe08l1CuixEYnM5vgpi8U7LJYvqs7YuJImXmffazB+5vVMiKOBkjCBjzAa
+BgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/BAIwADAOBgNVHQ8B
+Af8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFAmlI/lGMiqb
+IHwjNa2JVkSMcroRMB8GA1UdIwQYMBaAFAOOF/EPL17/odGsObzjJ0vBmYTGMAoG
+CCqGSM49BAMCA0kAMEYCIQChS+ceqM7pPgIdPxnJzQZNzLvR8GPHGSK8417JiMiz
+UwIhAMRL7MtiogQLi3C+0pV4mCKOoYSrAHF56HFxCkynHLz9
+-----END CERTIFICATE-----
+";
+
+/// Throwaway, see above.
+const TEST_SERVER_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3Bolmcbtd4ZQSMBK
+7s5yAT4OidKKk+nCQ/Fhz8o5Vg2hRANCAAQzsWz5TBDIW2AKHMPp54iXipqnFfQv
+cyNHiqe4Eh7TyXUK6LERiczm+CmLxTssli+qzti4kiZeZ99rMH7m9UyI
+-----END PRIVATE KEY-----
+";
+
+/// Write the test CA out so the proxy can be pointed at it with
+/// `--upstream-ca-cert`. The name keeps concurrent tests in one process off
+/// each other's file.
+fn write_ca_cert(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "postgres-wire-proxy-ca-{}-{name}.crt",
+        std::process::id()
+    ));
+    fs::write(&path, TEST_CA_PEM).expect("write the test CA");
+    path
+}
+
+fn tls_server_config() -> Arc<rustls::ServerConfig> {
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut TEST_SERVER_CERT_PEM.as_bytes())
+            .collect::<Result<_, _>>()
+            .expect("parse the test certificate");
+    let key = rustls_pemfile::private_key(&mut TEST_SERVER_KEY_PEM.as_bytes())
+        .expect("parse the test key")
+        .expect("the test key is present");
+
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("test TLS config"),
+    )
+}
+
+/// A fake upstream that answers the `SSLRequest` with 'S' and completes a real
+/// TLS handshake with the test certificate, then runs `script` on the decrypted
+/// stream.
+///
+/// A proxy that refuses the certificate never gets this far: `accept` fails and
+/// there is nothing to run, which is exactly what the verification tests want.
+fn spawn_tls_upstream<F, Fut>(script: F) -> u16
+where
+    F: FnOnce(tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("fake upstream accept");
+        stream.set_nodelay(true).unwrap();
+
+        let (code, _) = read_first_packet(&mut stream);
+        assert_eq!(code, SSL_REQUEST_CODE, "the proxy asks for TLS first");
+        stream.write_all(b"S").expect("agree to TLS");
+        stream.flush().unwrap();
+
+        // `from_std` only takes a non-blocking socket; the SSLRequest above was
+        // read with the socket still blocking.
+        stream
+            .set_nonblocking(true)
+            .expect("the socket becomes non-blocking");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a test runtime");
+        runtime.block_on(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_server_config());
+            let stream = tokio::net::TcpStream::from_std(stream).expect("adopt the socket");
+            if let Ok(tls) = acceptor.accept(stream).await {
+                // Bounded, so a wedged session fails the waiting assertion
+                // rather than hanging the test binary.
+                let _ = tokio::time::timeout(Duration::from_secs(5), script(tls)).await;
+            }
+        });
+    });
+
+    port
+}
+
+async fn read_first_packet_async<S: AsyncReadExt + Unpin>(stream: &mut S) {
+    let mut header = [0u8; 8];
+    stream
+        .read_exact(&mut header)
+        .await
+        .expect("read the proxy's first upstream packet");
+    let length = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; length - 8];
+    stream
+        .read_exact(&mut body)
+        .await
+        .expect("read the startup packet body");
+}
+
+async fn read_message_async<S: AsyncReadExt + Unpin>(stream: &mut S) {
+    let mut header = [0u8; 5];
+    stream
+        .read_exact(&mut header)
+        .await
+        .expect("read message header");
+    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0u8; length - 4];
+    stream
+        .read_exact(&mut body)
+        .await
+        .expect("read message body");
+}
+
+/// A one-row, one-column result set, as the TLS upstreams answer with.
+fn single_row_response() -> Vec<u8> {
+    let mut batch = row_description(&[("greeting", 25, 0)]);
+    batch.extend_from_slice(&data_row(&[Some(b"encrypted")]));
+    batch.extend_from_slice(&command_complete("SELECT 1"));
+    batch.extend_from_slice(&ready_for_query());
+    batch
 }
 
 #[test]
@@ -563,4 +766,163 @@ fn table_dynamic_width_requires_table_mode() {
         stderr.contains("--table"),
         "the error should name the missing flag: {stderr}"
     );
+}
+
+#[test]
+fn upstream_ssl_prefer_falls_back_to_plaintext_when_the_server_refuses() {
+    let upstream_port = screenshot_upstream(vec![("id", 23, 0)], vec![vec![b"1".to_vec()]]);
+    // `prefer` is the default; spelling it out pins that.
+    let proxy = Proxy::start(upstream_port, &["--upstream-ssl-mode", "prefer"]);
+    let _client = Client::connect(proxy.port, Some("select 1"));
+
+    let log = proxy.wait_for("← CommandComplete: SELECT 1", LOG_TIMEOUT);
+    assert!(log.contains("Upstream SSL: sent SSLRequest"), "{log}");
+    assert!(
+        log.contains("Upstream SSL: server refused TLS, continuing in plaintext"),
+        "{log}"
+    );
+}
+
+#[test]
+fn upstream_ssl_disable_sends_no_ssl_request() {
+    let upstream_port = spawn_upstream(|stream| {
+        // An SSLRequest first would fail this assertion, which is the whole
+        // point of `disable`.
+        read_startup_without_ssl(stream);
+        read_message(stream);
+        stream.write_all(&single_row_response()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let proxy = Proxy::start(upstream_port, &["--upstream-ssl-mode", "disable"]);
+    let _client = Client::connect(proxy.port, Some("select 1"));
+
+    let log = proxy.wait_for("← CommandComplete: SELECT 1", LOG_TIMEOUT);
+    assert!(log.contains("Upstream SSL disabled"), "{log}");
+    assert!(!log.contains("sent SSLRequest"), "{log}");
+}
+
+#[test]
+fn upstream_ssl_require_fails_when_the_server_refuses() {
+    let upstream_port = spawn_upstream(|stream| {
+        let (code, _) = read_first_packet(stream);
+        assert_eq!(code, SSL_REQUEST_CODE);
+        stream.write_all(b"N").unwrap();
+        stream.flush().unwrap();
+        // Whatever the proxy does next, the test asserts on its log.
+    });
+
+    let proxy = Proxy::start(upstream_port, &["--upstream-ssl-mode", "require"]);
+    let _client = Client::connect(proxy.port, None);
+
+    let log = proxy.wait_for("Upstream refused TLS", LOG_TIMEOUT);
+    assert!(
+        !log.contains("→ Startup message"),
+        "a refused TLS connection must not be carried on in plaintext:\n{log}"
+    );
+}
+
+#[test]
+fn upstream_tls_failure_is_not_retried_in_plaintext() {
+    // A server that says 'S' and then speaks plaintext. The handshake cannot
+    // succeed, and the proxy must not fall back to the clear.
+    let upstream_port = spawn_upstream(|stream| {
+        read_first_packet(stream);
+        stream.write_all(b"S").unwrap();
+        // Not a TLS record at all: an ErrorResponse, which is what a confused
+        // server would send.
+        stream.write_all(&message(b'E', b"SFATAL\x00")).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let proxy = Proxy::start(upstream_port, &[]);
+    let _client = Client::connect(proxy.port, None);
+
+    let log = proxy.wait_for("Upstream TLS handshake failed", LOG_TIMEOUT);
+    assert!(!log.contains("→ Startup message"), "{log}");
+}
+
+#[test]
+fn upstream_tls_verifies_the_server_against_the_given_ca() {
+    let upstream_port = spawn_tls_upstream(|mut tls| async move {
+        read_first_packet_async(&mut tls).await;
+        read_message_async(&mut tls).await;
+        tls.write_all(&single_row_response()).await.unwrap();
+        tls.flush().await.unwrap();
+    });
+    let ca = write_ca_cert("verified");
+
+    let proxy = Proxy::start(upstream_port, &["--upstream-ca-cert", ca.to_str().unwrap()]);
+    let _client = Client::connect(proxy.port, Some("select 1"));
+
+    let log = proxy.wait_for("← CommandComplete: SELECT 1", LOG_TIMEOUT);
+    assert!(log.contains("Upstream TLS handshake complete"), "{log}");
+    assert!(
+        log.contains("Upstream SSL: server agreed to TLS"),
+        "{log}"
+    );
+    assert!(
+        log.contains("Value 1: 'encrypted'"),
+        "the row must arrive over TLS:\n{log}"
+    );
+    assert!(!log.contains("Upstream SSL: server refused"), "{log}");
+}
+
+#[test]
+fn upstream_tls_rejects_a_certificate_it_cannot_verify() {
+    let upstream_port = spawn_tls_upstream(|mut tls| async move {
+        // Unreachable: the proxy does not finish the handshake.
+        read_first_packet_async(&mut tls).await;
+    });
+
+    // No --upstream-ca-cert. The test CA is not in the bundled Mozilla roots,
+    // so verification has to fail; that is what makes the option meaningful.
+    let proxy = Proxy::start(upstream_port, &[]);
+    let _client = Client::connect(proxy.port, None);
+
+    let log = proxy.wait_for("Upstream TLS handshake failed", LOG_TIMEOUT);
+    // The reason has to be the certificate, not an unrelated failure: this is
+    // the assertion that would catch a verifier that stopped verifying.
+    assert!(
+        log.contains("UnknownIssuer"),
+        "expected the test CA to be untrusted, got:\n{log}"
+    );
+    assert!(!log.contains("→ Startup message"), "{log}");
+}
+
+#[test]
+fn upstream_tls_insecure_accepts_an_untrusted_certificate() {
+    let upstream_port = spawn_tls_upstream(|mut tls| async move {
+        read_first_packet_async(&mut tls).await;
+        read_message_async(&mut tls).await;
+        tls.write_all(&single_row_response()).await.unwrap();
+        tls.flush().await.unwrap();
+    });
+
+    let proxy = Proxy::start(upstream_port, &["--upstream-tls-insecure"]);
+    let _client = Client::connect(proxy.port, Some("select 1"));
+
+    let log = proxy.wait_for("← CommandComplete: SELECT 1", LOG_TIMEOUT);
+    assert!(log.contains("Upstream SSL: server agreed to TLS"), "{log}");
+    assert!(log.contains("verifying nothing"), "{log}");
+    assert!(
+        log.contains("certificate verification is off"),
+        "the startup warning is missing:\n{log}"
+    );
+    assert!(log.contains("Value 1: 'encrypted'"), "{log}");
+}
+
+#[test]
+fn upstream_tls_options_are_refused_with_disable() {
+    let output = Command::new(env!("CARGO_BIN_EXE_postgres-wire-proxy"))
+        .args(["--upstream-ssl-mode", "disable", "--upstream-tls-insecure"])
+        .output()
+        .expect("run the proxy");
+
+    assert!(
+        !output.status.success(),
+        "--upstream-tls-insecure means nothing with --upstream-ssl-mode disable"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("have no effect"), "{stderr}");
 }

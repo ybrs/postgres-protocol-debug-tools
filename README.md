@@ -16,6 +16,7 @@ Key capabilities:
 - Bidirectional forwarding with minimal latency overhead
 - Detailed protocol decoding for both client and server messages
 - Optional TLS termination using `rustls`
+- Optional TLS to the upstream, `disable`/`prefer`/`require`, verified against the bundled Mozilla roots or a CA of your own
 - Flexible logging (stdout and/or file sinks) powered by `tracing`
 - **Table mode**: Display query results in formatted tables instead of raw DataRow messages
 - Configurable via CLI flags for listener address, upstream target, and logging settings
@@ -40,6 +41,11 @@ Options:
       --log-format <LOG_FORMAT>        Log format (full, short, bare) Full: Timestamp, Level, Target/Module, ClientIP:Port, Message Short: Timestamp, ClientIP:Port, Message Bare: Client IP:Port, Message [default: full] [possible values: full, short, bare]
       --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs
       --table                          Enable table formatting for DataRow output
+      --table-dynamic-width            Size table columns to their content instead of the fixed 15 characters (requires --table)
+      --upstream-ssl-mode <MODE>       How to ask the upstream for TLS: disable, prefer, require [default: prefer]
+      --upstream-ca-cert <CA_CERT>     Extra CA certificate (PEM) to verify the upstream against
+      --upstream-server-name <NAME>    Name to verify the upstream certificate against and send as SNI [default: --upstream-host]
+      --upstream-tls-insecure          Accept any upstream certificate: encrypt, but do not authenticate the server
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -245,6 +251,29 @@ Worth knowing:
   uses `trust`, so `scripts/postgres.sh psql` needs no password.
 - `ssl` is off, so a client's `SSLRequest` is answered `N` — the proxy's plaintext
   path. Pass `--ssl-cert`/`--ssl-key` to the proxy to exercise TLS termination.
+- `PG_SSL=on scripts/postgres.sh start` serves TLS instead, from a private CA the
+  script generates into `.pg/tls` (`scripts/postgres.sh tls` generates it on its
+  own). That is what exercises `--upstream-ssl-mode`, `--upstream-ca-cert` and
+  `--upstream-tls-insecure` against a real server: the CA verifies, the bundled
+  Mozilla roots deliberately do not, and `--upstream-ssl-mode require` fails when
+  the server has `ssl` off. See
+  [Upstream TLS](postgres-wire-proxy/README.md#upstream-tls) for the flag matrix.
+- Once the upstream is on TLS, PostgreSQL offers `SCRAM-SHA-256-PLUS`, which a
+  plaintext client of the proxy refuses (`server offered SCRAM-SHA-256-PLUS
+  authentication over a non-SSL connection`). Give the proxy the same certificate
+  the server uses and connect to it with TLS, or use an auth method without
+  channel binding; the details are in
+  [SCRAM channel binding through the proxy](postgres-wire-proxy/README.md#scram-channel-binding-through-the-proxy).
+  A complete working local recipe, with the client's result coming back through
+  the proxy:
+
+  ```bash
+  PG_SSL=on scripts/postgres.sh start
+  cargo run -p postgres-wire-proxy -- --ssl-cert .pg/tls/server.crt \
+    --ssl-key .pg/tls/server.key --upstream-ca-cert .pg/tls/ca.crt
+  psql "postgresql://postgres:postgres@127.0.0.1:5466/postgres?sslmode=verify-full&sslrootcert=$PWD/.pg/tls/ca.crt" \
+    -c "select 1, ssl from pg_stat_ssl where pid = pg_backend_pid()"
+  ```
 - Rows bigger than the proxy's 8 KiB read buffer arrive split by construction, e.g.
   `psql "postgresql://postgres:postgres@127.0.0.1:5466/postgres" -c "select repeat('x', 20000)"`.
 - `rm -rf .pg` starts over from a fresh download.
