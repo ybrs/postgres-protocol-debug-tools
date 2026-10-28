@@ -7,7 +7,8 @@
 # and gitignored.
 #
 #   scripts/postgres.sh start      # download + initdb + start, prints the URL
-#   scripts/postgres.sh psql       # interactive psql against it
+#   scripts/postgres.sh start-ssl  # the same, with TLS on (same as PG_SSL=on start)
+#   scripts/postgres.sh psql       # interactive psql against the running server
 #   scripts/postgres.sh status
 #   scripts/postgres.sh stop
 #   scripts/postgres.sh tls        # generate a test CA and server certificate
@@ -208,7 +209,10 @@ cmd_status() {
 }
 
 cmd_psql() {
-  start_quiet
+  # Never starts the server: that would mean restarting a TLS server in plaintext
+  # just because PG_SSL happens to be unset, which is the opposite of what "psql"
+  # looks like it does.
+  running || die "not running (start it with: $0 start, or $0 start-ssl)"
   PGPASSWORD="$PG_PASSWORD" exec "$VENDOR/bin/psql" \
     -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres "$@"
 }
@@ -229,11 +233,16 @@ cmd_help() {
   # line that is not a comment.
   awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
   echo
-  echo "commands: start, stop, status, psql [args...], url, tls"
+  echo "commands: start, start-ssl, stop, status, psql [args...], url, tls"
 }
 
 case "${1:-help}" in
   start) cmd_start ;;
+  start-ssl)
+    # Same as PG_SSL=on start, for when the TLS mode is not something to remember.
+    PG_SSL=on
+    cmd_start
+    ;;
   stop) cmd_stop ;;
   status) cmd_status ;;
   psql)
@@ -243,5 +252,5 @@ case "${1:-help}" in
   url) cmd_url ;;
   tls) cmd_tls ;;
   help | -h | --help) cmd_help ;;
-  *) die "unknown command '$1' (try: start, stop, status, psql, url, tls)" ;;
+  *) die "unknown command '$1' (try: start, start-ssl, stop, status, psql, url, tls)" ;;
 esac

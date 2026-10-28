@@ -228,6 +228,7 @@ cluster there; the whole directory is gitignored.
 
 ```bash
 scripts/postgres.sh start     # first run downloads ~40 MB, runs initdb, starts on 127.0.0.1:5432
+scripts/postgres.sh start-ssl # the same, but the server serves TLS (PG_SSL=on start)
 export PATH="$PWD/.pg/vendor/full/bin:$PATH"   # psql, pg_dump, pg_isready, ...
 cargo run -p postgres-wire-proxy -- --table --no-hex-dump --log-file proxy.log
 scripts/postgres.sh psql      # a session straight to the server
