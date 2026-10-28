@@ -42,7 +42,7 @@ Options:
       --no-hex-dump                    hex-dump/no-hex-dump: Include/Exclude hex dumps of wire data in logs
       --table                          Enable table formatting for DataRow output
       --table-dynamic-width            Size table columns to their content instead of the fixed 15 characters (requires --table)
-      --upstream-ssl-mode <MODE>       How to ask the upstream for TLS: disable, prefer, require [default: prefer]
+      --upstream-ssl-mode <MODE>       How to ask the upstream for TLS: disable, prefer, require; prefer falls back to plaintext if the server refuses or the handshake fails [default: prefer]
       --upstream-ca-cert <CA_CERT>     Extra CA certificate (PEM) to verify the upstream against
       --upstream-server-name <NAME>    Name to verify the upstream certificate against and send as SNI [default: --upstream-host]
       --upstream-tls-insecure          Accept any upstream certificate: encrypt, but do not authenticate the server
@@ -256,7 +256,9 @@ Worth knowing:
   own). That is what exercises `--upstream-ssl-mode`, `--upstream-ca-cert` and
   `--upstream-tls-insecure` against a real server: the CA verifies, the bundled
   Mozilla roots deliberately do not, and `--upstream-ssl-mode require` fails when
-  the server has `ssl` off. See
+  the server has `ssl` off. Without `--upstream-ca-cert` the default `prefer`
+  logs `Upstream TLS handshake failed (... UnknownIssuer); reconnecting in
+  plaintext` and the session still works, in the clear. See
   [Upstream TLS](postgres-wire-proxy/README.md#upstream-tls) for the flag matrix.
 - Once the upstream is on TLS, PostgreSQL offers `SCRAM-SHA-256-PLUS`, which a
   plaintext client of the proxy refuses (`server offered SCRAM-SHA-256-PLUS

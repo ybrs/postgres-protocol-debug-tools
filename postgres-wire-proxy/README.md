@@ -93,9 +93,11 @@ How it behaves:
   backend reached by IP address or through a tunnel.
 - `--upstream-tls-insecure` accepts any certificate, and warns at startup. That
   is encryption without authentication: for a server whose CA you cannot obtain.
-- `prefer` falls back only on a refusal (`N`). A certificate failure - or a
-  handshake that starts and fails - ends the connection; nothing is retried in
-  the clear.
+- `prefer` behaves as libpq's `sslmode=prefer` does: it asks for TLS, and if the
+  server refuses (`N`) or the handshake fails (an untrusted certificate, a
+  protocol mismatch) it connects again in plaintext, warning with the reason and
+  the flags that would fix it. Nothing is silently downgraded: every fallback is
+  a `WARN` line. Use `require` when a plaintext connection must not happen.
 - `--upstream-ca-cert`, `--upstream-server-name` and `--upstream-tls-insecure`
   are rejected with `--upstream-ssl-mode disable` rather than silently ignored.
 
@@ -104,6 +106,16 @@ How it behaves:
 [127.0.0.1:54171] Upstream SSL: sent SSLRequest
 [127.0.0.1:54171] Upstream SSL: server agreed to TLS, handshaking (server name "localhost")
 [127.0.0.1:54171] Upstream TLS handshake complete
+```
+
+And when the certificate cannot be verified, under the default `prefer`:
+
+```
+[127.0.0.1:52400] Upstream TLS handshake failed (invalid peer certificate: UnknownIssuer);
+reconnecting in plaintext because --upstream-ssl-mode=prefer. Pass --upstream-ca-cert
+<pem> to trust a private CA, --upstream-tls-insecure to skip verification, or
+--upstream-ssl-mode=require to fail instead
+[127.0.0.1:52400] Upstream SSL: falling back to plaintext
 ```
 
 #### SCRAM channel binding through the proxy
@@ -237,7 +249,8 @@ Options:
       --table-dynamic-width            Size table columns to their content instead of
                                        the fixed 15 characters (requires --table)
       --upstream-ssl-mode <MODE>       How to ask the upstream for TLS: disable, prefer,
-                                       require [default: prefer]
+                                       require; prefer falls back to plaintext if the server
+                                       refuses or the handshake fails [default: prefer]
       --upstream-ca-cert <CA_CERT>     Extra CA certificate (PEM) to verify the upstream
                                        against. Added to the bundled Mozilla roots
       --upstream-server-name <NAME>    Name to verify the upstream certificate against
@@ -382,5 +395,5 @@ rootless PostgreSQL 18 in `.pg/`; see
 
 - Each client connection gets its own upstream connection, one to one, with no pooling: a client session and the upstream session it stands for stay the same thing, which is what makes the log a faithful trace of one session
 - Logs are written to stdout with ANSI colors and to file without colors
-- SSL termination happens at the proxy; the upstream connection follows `--upstream-ssl-mode`, so it is TLS when the server offers it and plaintext when it does not
+- SSL termination happens at the proxy; the upstream connection follows `--upstream-ssl-mode`, so it is TLS when the server offers it (and verifies) and plaintext when it does not, or when `prefer` falls back after a failed handshake
 - The proxy does not modify any protocol messages, it only observes and logs them

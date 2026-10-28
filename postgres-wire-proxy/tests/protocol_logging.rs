@@ -822,23 +822,87 @@ fn upstream_ssl_require_fails_when_the_server_refuses() {
     );
 }
 
+/// A server that says 'S' and then speaks plaintext. The handshake cannot
+/// succeed.
+fn handshake_refused_upstream(stream: &mut TcpStream) {
+    read_first_packet(stream);
+    stream.write_all(b"S").unwrap();
+    // Not a TLS record at all: an ErrorResponse, which is what a confused
+    // server would send.
+    stream.write_all(&message(b'E', b"SFATAL\x00")).unwrap();
+    stream.flush().unwrap();
+}
+
+/// Accept two connections in a row and run `first` on one, `second` on the
+/// other. Used to show that a failed handshake leads to a second, plaintext
+/// connection rather than a retry on the broken one.
+fn spawn_upstream_twice(
+    first: impl FnOnce(&mut TcpStream) + Send + 'static,
+    second: impl FnOnce(&mut TcpStream) + Send + 'static,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        for script in [
+            Box::new(first) as Box<dyn FnOnce(&mut TcpStream)>,
+            Box::new(second),
+        ] {
+            let (mut stream, _) = listener.accept().expect("fake upstream accept");
+            stream.set_nodelay(true).unwrap();
+            script(&mut stream);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+
+    port
+}
+
 #[test]
-fn upstream_tls_failure_is_not_retried_in_plaintext() {
-    // A server that says 'S' and then speaks plaintext. The handshake cannot
-    // succeed, and the proxy must not fall back to the clear.
-    let upstream_port = spawn_upstream(|stream| {
-        read_first_packet(stream);
-        stream.write_all(b"S").unwrap();
-        // Not a TLS record at all: an ErrorResponse, which is what a confused
-        // server would send.
-        stream.write_all(&message(b'E', b"SFATAL\x00")).unwrap();
+fn upstream_ssl_prefer_falls_back_when_the_handshake_fails() {
+    // `prefer` is the default, and means what libpq's sslmode=prefer means: a
+    // backend whose certificate cannot be verified is still usable in
+    // plaintext, with a warning, rather than refusing every connection.
+    let upstream_port = spawn_upstream_twice(handshake_refused_upstream, |stream| {
+        // A fresh connection, and no second SSLRequest: the proxy already knows
+        // TLS does not work with this server.
+        read_startup_without_ssl(stream);
+        read_message(stream);
+        stream.write_all(&single_row_response()).unwrap();
         stream.flush().unwrap();
     });
 
     let proxy = Proxy::start(upstream_port, &[]);
+    let _client = Client::connect(proxy.port, Some("select 1"));
+
+    let log = proxy.wait_for("← CommandComplete: SELECT 1", LOG_TIMEOUT);
+    assert!(log.contains("Upstream TLS handshake failed"), "{log}");
+    assert!(
+        log.contains("reconnecting in plaintext"),
+        "the downgrade has to be reported, not silent:\n{log}"
+    );
+    assert!(
+        log.contains("Upstream SSL: falling back to plaintext"),
+        "{log}"
+    );
+    assert!(
+        log.contains("Value 1: 'encrypted'"),
+        "the row must arrive over the fallback connection:\n{log}"
+    );
+}
+
+#[test]
+fn upstream_tls_failure_is_not_retried_in_plaintext_under_require() {
+    let upstream_port = spawn_upstream(handshake_refused_upstream);
+
+    let proxy = Proxy::start(upstream_port, &["--upstream-ssl-mode", "require"]);
     let _client = Client::connect(proxy.port, None);
 
     let log = proxy.wait_for("Upstream TLS handshake failed", LOG_TIMEOUT);
+    assert!(
+        !log.contains("falling back to plaintext"),
+        "require must never retry in the clear:\n{log}"
+    );
     assert!(!log.contains("→ Startup message"), "{log}");
 }
 
@@ -875,14 +939,14 @@ fn upstream_tls_rejects_a_certificate_it_cannot_verify() {
         read_first_packet_async(&mut tls).await;
     });
 
-    // No --upstream-ca-cert. The test CA is not in the bundled Mozilla roots,
-    // so verification has to fail; that is what makes the option meaningful.
-    let proxy = Proxy::start(upstream_port, &[]);
+    // No --upstream-ca-cert, and require, so the failure is fatal instead of
+    // falling back: this is the test that catches a verifier that stopped
+    // verifying.
+    let proxy = Proxy::start(upstream_port, &["--upstream-ssl-mode", "require"]);
     let _client = Client::connect(proxy.port, None);
 
     let log = proxy.wait_for("Upstream TLS handshake failed", LOG_TIMEOUT);
-    // The reason has to be the certificate, not an unrelated failure: this is
-    // the assertion that would catch a verifier that stopped verifying.
+    // The reason has to be the certificate, not an unrelated failure.
     assert!(
         log.contains("UnknownIssuer"),
         "expected the test CA to be untrusted, got:\n{log}"

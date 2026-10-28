@@ -71,8 +71,9 @@ struct Args {
     table_dynamic_width: bool,
 
     /// How to ask the upstream for TLS: disable, prefer, require.
-    /// disable: never ask. prefer: ask, carry on in plaintext if refused.
-    /// require: ask, and treat a refusal as a connection error
+    /// disable: never ask. prefer: ask, and carry on in plaintext if the server
+    /// refuses or the handshake fails. require: ask, and treat a refusal or a
+    /// failed handshake as a connection error
     #[arg(long, value_enum, default_value_t = UpstreamSslMode::default())]
     upstream_ssl_mode: UpstreamSslMode,
 

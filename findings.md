@@ -363,22 +363,27 @@ long value becomes `'a much l...`.
 | Flag | Meaning |
 | --- | --- |
 | `--upstream-ssl-mode disable` | Never send an `SSLRequest` |
-| `--upstream-ssl-mode prefer` | Ask; plaintext on `N` (default, as before) |
-| `--upstream-ssl-mode require` | Ask; a refusal is a connection error |
+| `--upstream-ssl-mode prefer` | Ask; plaintext on `N` or a failed handshake, with a warning (default) |
+| `--upstream-ssl-mode require` | Ask; a refusal or a failed handshake is a connection error |
 | `--upstream-ca-cert <PEM>` | Trust anchor added to the bundled Mozilla roots |
 | `--upstream-server-name <name>` | Name verified and sent as SNI (default `--upstream-host`) |
 | `--upstream-tls-insecure` | Accept any certificate; warns at startup |
 
 The three trust flags are refused with `--upstream-ssl-mode disable`, so an
 option that cannot apply is an error rather than a silent no-op. Trust comes from
-`webpki-roots` (new dependency) plus the CA file; `prefer` falls back only on an
-`N`, and a failed handshake is never retried in the clear, which is the one place
-this deliberately differs from libpq.
+`webpki-roots` (new dependency) plus the CA file. `prefer` falls back on an `N`
+and on a failed handshake, freshly reconnecting without an `SSLRequest`, and
+warns with the reason plus the flags that would fix it - the same trade libpq's
+`sslmode=prefer` makes. Misconfiguration (an unreadable CA file, a server name
+that is neither DNS nor IP) stays fatal in every mode, so a fallback cannot hide
+a broken flag; `require` never falls back at all.
 
 Tests: the negotiation cases run through the real binary against a fake upstream
 that answers `N` (`prefer` fallback, `require` fails and forwards nothing, and
 `disable` provably sends no `SSLRequest` at all, asserted on the first four bytes
-on the wire), plus a server that answers `S` and then speaks plaintext. The
+on the wire), a server that answers `S` and then speaks plaintext (the session
+continues over the proxy's second, plaintext connection, and the log says so),
+and the same server under `require` (nothing is forwarded). The
 verification cases use a fake upstream that completes a real rustls handshake
 with an embedded test certificate, which is what makes the pair meaningful: with
 `--upstream-ca-cert` the session runs, and without it the handshake fails with
@@ -393,7 +398,8 @@ CA and a server certificate into `.pg/tls`. With PostgreSQL 18.6 on
 
 | Configuration | Observed |
 | --- | --- |
-| default (`prefer`, verified), no CA | `Upstream TLS handshake failed: invalid peer certificate: UnknownIssuer` |
+| default (`prefer`, verified), no CA | `Upstream TLS handshake failed (... UnknownIssuer); reconnecting in plaintext`, then the session runs |
+| `require`, no CA | `Upstream TLS handshake failed: invalid peer certificate: UnknownIssuer. If localhost:5432 uses a private CA, pass --upstream-ca-cert ...` and the session ends |
 | `--upstream-ca-cert .pg/tls/ca.crt` | `Upstream TLS handshake complete` |
 | `--upstream-tls-insecure` | handshake completes, `verifying nothing` warned at startup |
 | `--upstream-server-name localhost` + CA | handshake completes (the certificate carries `DNS:localhost` and `IP:127.0.0.1`) |

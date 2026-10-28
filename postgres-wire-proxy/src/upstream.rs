@@ -8,7 +8,7 @@
 //! What does not change is the logging: the proxy still reads plaintext on both
 //! sides, because it terminates rather than tunnels.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::ValueEnum;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -47,7 +47,8 @@ const SSL_REQUEST_PACKET: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 pub enum UpstreamSslMode {
     /// Never send an SSLRequest; always talk to the backend in plaintext
     Disable,
-    /// Ask for TLS; carry on in plaintext if the server refuses (default)
+    /// Ask for TLS; carry on in plaintext if the server refuses or the
+    /// handshake fails (default), as libpq's `sslmode=prefer` does
     Prefer,
     /// Require TLS; treat a refusal, or a failed handshake, as fatal
     Require,
@@ -139,6 +140,9 @@ pub async fn connect(
                 );
             }
 
+            // A missing or unusable CA file, or a server name that is neither a
+            // DNS name nor an IP address, is a configuration mistake. Retrying
+            // in the clear would bury it, so it stays fatal in every mode.
             let config = Arc::new(build_client_config(ssl)?);
             let server_name = ServerName::try_from(server_name.clone()).with_context(|| {
                 format!(
@@ -147,12 +151,34 @@ pub async fn connect(
             })?;
             let connector = tokio_rustls::TlsConnector::from(config);
 
-            let tls = connector
-                .connect(server_name, socket)
-                .await
-                .context("Upstream TLS handshake failed")?;
-            info!("[{}] Upstream TLS handshake complete", client_addr);
-            Ok(Box::new(tls))
+            match connector.connect(server_name, socket).await {
+                Ok(tls) => {
+                    info!("[{}] Upstream TLS handshake complete", client_addr);
+                    Ok(Box::new(tls))
+                }
+                Err(err) if ssl.mode == UpstreamSslMode::Prefer => {
+                    warn!(
+                        "[{}] Upstream TLS handshake failed ({err}); reconnecting in plaintext \
+                         because --upstream-ssl-mode=prefer. Pass --upstream-ca-cert <pem> to \
+                         trust a private CA, --upstream-tls-insecure to skip verification, or \
+                         --upstream-ssl-mode=require to fail instead",
+                        client_addr
+                    );
+
+                    // The socket the handshake consumed is unusable, so this is
+                    // a fresh connection that skips the SSLRequest entirely.
+                    let socket = TcpStream::connect((host, port)).await.with_context(|| {
+                        format!("Failed to reconnect to upstream {host}:{port} in plaintext")
+                    })?;
+                    info!("[{}] Upstream SSL: falling back to plaintext", client_addr);
+                    Ok(Box::new(socket))
+                }
+                Err(err) => Err(anyhow!(
+                    "Upstream TLS handshake failed: {err}. If {host}:{port} uses a private CA, \
+                     pass --upstream-ca-cert <pem>; --upstream-tls-insecure skips verification; \
+                     --upstream-ssl-mode=disable talks in plaintext"
+                )),
+            }
         }
         b'N' => {
             if ssl.mode == UpstreamSslMode::Require {
