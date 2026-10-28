@@ -95,6 +95,15 @@ running() {
   [ -x "$VENDOR/bin/pg_ctl" ] && "$VENDOR/bin/pg_ctl" -D "$DATA" status >/dev/null 2>&1
 }
 
+# What the *running* server has `ssl` set to, or nothing when it is not running.
+# The cluster's postgresql.conf is never edited - ssl is a command-line option -
+# so the file tells you nothing about the process that is actually serving.
+running_ssl() {
+  running || return 0
+  "$VENDOR/bin/psql" -h "$RUN" -p "$PG_PORT" -U "$PG_USER" -d postgres \
+    -tAc "show ssl" 2>/dev/null | tr -d '[:space:]'
+}
+
 # A private CA plus a server certificate for it, so PG_SSL=on is something the
 # proxy can verify rather than only something it can talk to.
 ensure_tls_certs() {
@@ -124,8 +133,24 @@ ensure_tls_certs() {
 start_quiet() {
   install_postgres
   init_cluster
+
+  local want=off
+  [ "$PG_SSL" = on ] && want=on
+
   if running; then
-    return 0
+    # A running cluster keeps the options it was started with, so "start" has
+    # to mean "start with this TLS mode". Returning early here would leave a
+    # server from an earlier `PG_SSL=on start` serving TLS while the caller
+    # asked for plaintext - which looks exactly like the proxy failing to
+    # connect to a server that "does not have TLS set up".
+    local have
+    have=$(running_ssl)
+    if [ "$have" != "$want" ]; then
+      echo "postgres.sh: restarting: the running server has ssl=${have:-?}, not ssl=$want" >&2
+      "$VENDOR/bin/pg_ctl" -D "$DATA" -w -t 60 stop -m fast >/dev/null
+    else
+      return 0
+    fi
   fi
   mkdir -p "$RUN"
   # With ssl off, a client's SSLRequest gets 'N', which is the proxy's plaintext
@@ -156,6 +181,8 @@ cmd_start() {
   if [ "$PG_SSL" = on ]; then
     echo "  ssl:     on, from ${TLS#$ROOT/}"
     echo "           proxy: --upstream-ca-cert ${TLS#$ROOT/}/ca.crt"
+  else
+    echo "  ssl:     off (a client's SSLRequest is answered N)"
   fi
 }
 
@@ -173,6 +200,7 @@ cmd_status() {
     "$VENDOR/bin/pg_isready" -h 127.0.0.1 -p "$PG_PORT"
     echo "data: ${DATA#$ROOT/}"
     echo "pid:  $(head -1 "$DATA/postmaster.pid")"
+    echo "ssl:  $(running_ssl)"
   else
     echo "not running"
     exit 1

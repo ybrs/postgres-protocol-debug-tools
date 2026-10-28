@@ -251,6 +251,10 @@ Worth knowing:
   uses `trust`, so `scripts/postgres.sh psql` needs no password.
 - `ssl` is off, so a client's `SSLRequest` is answered `N` — the proxy's plaintext
   path. Pass `--ssl-cert`/`--ssl-key` to the proxy to exercise TLS termination.
+  `start` compares the running server's `ssl` against `PG_SSL` and restarts it when
+  they differ: the cluster keeps the flags it was started with, and
+  `postgresql.conf` never records them, so a leftover `PG_SSL=on` server would
+  otherwise stay on TLS while the file still reads `#ssl = off`.
 - `PG_SSL=on scripts/postgres.sh start` serves TLS instead, from a private CA the
   script generates into `.pg/tls` (`scripts/postgres.sh tls` generates it on its
   own). That is what exercises `--upstream-ssl-mode`, `--upstream-ca-cert` and
